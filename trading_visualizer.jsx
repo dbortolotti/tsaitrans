@@ -1,0 +1,248 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+import { LineChart, Line, XAxis, YAxis, ReferenceLine, Tooltip, ResponsiveContainer, Area, AreaChart, ComposedChart, Scatter, Bar } from "recharts";
+
+const DEMO = {"summary":{"total_pnl":-0.411,"sharpe":1.8,"max_drawdown":-0.5,"n_buys":56,"n_sells":53,"n_total_fills":109,"avg_abs_position":1.82,"total_reward":-0.37,"n_steps":400},"times":[...Array(400).keys()],"mid_prices":[100.48,98.93,100.06,101.49,98.54,96.64,96.84,96.4,96.4,95.19,96.46,97.6,97.72,99.39,100.11,98.84,99.41,98.0,99.31,99.25,99.0,98.01,99.82,99.61,98.99,98.49,99.29,99.86,100.5,101.17,104.44,103.82,103.04,101.81,102.77,104.53,104.37,103.08,101.82,102.84,104.0,104.87,103.84,104.23,104.43,104.79,106.18,106.56,107.67,107.8,108.29,109.34,106.97,106.48,105.75,104.75,104.34,106.7,105.34,106.89,104.21,103.71,103.98,104.92,106.06,107.34,106.8,106.08,107.47,107.18,105.15,103.39,101.98,102.76,103.0,104.09,103.44,103.71,104.7,104.24,104.97,103.95,103.41,102.84,101.01,101.77,101.07,101.11,101.86,102.57,103.61,103.48,102.84,102.74,100.16,98.0,96.08,94.66,95.25,93.97,93.46,95.3,94.81,95.88,94.55,94.28,92.96,92.5,93.69,91.28,91.89,92.24,91.43,89.47,89.58,88.89,89.22,89.26,91.43,91.12,89.74,90.0,90.31,92.17,93.34,93.86,95.94,94.25,93.36,92.08,91.56,89.69,90.56,90.28,88.31,86.98,87.41,88.52,91.19,95.2,95.81,94.4,91.4,91.79,90.69,90.14,89.33,89.16,90.6,90.84,90.64,89.25,87.02,86.41,86.35,88.66,88.85,90.18,89.52,87.95,86.69,85.77,88.52,87.45,88.57,87.39,88.62,89.15,88.96,88.93,88.07,88.68,88.09,86.49,84.85,85.08,87.12,87.34,87.2,87.6,89.33,89.64,89.11,90.6,91.2,93.32,93.6,91.9,90.03,92.28,94.68,94.45,93.92,96.0,94.42,93.18,94.09,93.56,93.57,93.36,93.85,95.85,96.0,96.94,93.98,93.93,92.76,91.09,89.9,89.47,90.72,88.93,88.99,88.36,87.95,89.29,90.02,91.85,91.65,90.71,90.43,90.78,91.03,89.57,89.71,90.04,93.45,96.1,94.89,94.5,92.45,91.65,92.1,93.78,92.78,91.88,88.94,88.74,87.35,86.67,85.55,85.44,83.21,81.39,84.01,82.41,81.07,83.32,86.96,85.45,85.0,85.45,87.68,86.4,86.1,87.12,87.71,87.23,87.07,85.29,85.01,84.68,85.0,84.31,84.92,86.23,86.44,86.92,87.0,87.02,86.1,86.52,86.41,89.14,91.27,91.81,90.78,89.28,90.9,91.27,91.95,89.56,90.82,91.46,89.96,89.34,89.71,89.8,89.42,89.3,88.98,89.2,91.19,87.7,87.4,87.65,88.06,87.59,85.3,85.73,87.97,85.96,87.1,86.68,86.62,85.27,84.86,86.53,87.3,89.59,91.19,91.81,94.23,94.87,96.07,95.66,95.77,94.79,96.22,94.53,95.66,95.41,97.1,98.22,100.92,102.05,99.66,99.58,97.85,97.11,99.33,100.3,99.27,97.78,97.84,96.08,95.13,95.59,97.27,98.18,94.82,95.28,95.4,96.01,98.36,95.33,94.51,95.36,93.12,95.2,95.74,96.98,96.17,97.36,98.94,99.31,99.67,100.1,98.82,98.62,98.42,99.0,100.51,98.93,98.77,100.98,99.88,98.66,98.98,100.26,100.29,102.31,103.65,104.98,105.87,109.59,109.27,106.01,108.58,107.86,108.06,110.2,107.57,105.58,103.06,101.85,102.55,103.37,103.82,101.64,98.14,98.24,97.56,98.26,99.31,99.54,100.69,101.06,101.88,100.82],"positions":[0,0,0,0,-1,-1,-2,-2,-2,-1,-1,-2,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,1,1,2,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,2,2,2,2,1,1,0,0,0,1,1,1,1,2,2,3,3,2,2,2,2,1,1,0,0,0,-1,0,0,0,0,1,1,1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,1,1,0,0,0,0,-1,-2,-3,-3,-3,-3,-3,-3,-3,-3,-3,-3,-3,-3,-3,-3,-3,-3,-3,-3,-3,-4,-4,-4,-4,-4,-4,-4,-4,-4,-4,-4,-3,-3,-3,-3,-3,-3,-2,-2,-2,-2,-1,-1,0,0,0,1,1,1,1,1,2,2,2,2,2,2,2,1,1,1,1,1,2,2,2,2,2,2,2,1,1,1,1,1,2,2,1,2,3,3,3,3,3,3,3,4,4,4,4,3,3,3,3,3,3,3,3,4,4,4,3,3,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,3,3,3,3,2,1,1,0,-1,-1,-1,-1,-1,-2,-3,-3,-3,-3,-2,-2,-2,-1,0,0,1,1,1,1,1,1,1,1,1,1,1,2,3,3,3,3,3,3,2,2,3,2,2,2,1,1,1,1,1,0,-1,-2,-2,-2,-2,-1,-1,-1,-1,-1,-2,-2,-2,-2,-2,-2,-1,-1,-1,-1,-1,-1,0,0,-1,-1,-1,0,0,0,0,0,0,0,-1,-1,0,1,1,1,1,1,1,1,1,2,2,1,0,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,1,0,0,0,-1,-1,-1,-1,-1,-1,0,0,-1,-1,-1,-1,-1,-1,-1,0,0,0,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,0,0,0,1,1,2,2,3,3,3,3,3,2,2,2,2,2,3,4,4,5,5,5,5,5,5,5,5,5,5,4,3],"cum_pnl":[-0.04,-0.1,-0.07,-0.02,0.08,0.03,-0.03,-0.03,-0.07,-0.05,-0.06,-0.12,-0.18,-0.11,-0.16,-0.18,-0.21,-0.2,-0.2,-0.12,-0.03,-0.03,-0.04,0.04,0.01,0.01,0.06,0.04,0.0,0.03,0.01,0.02,0.04,-0.07,-0.06,-0.06,-0.05,-0.16,-0.23,-0.28,-0.41,-0.42,-0.35,-0.41,-0.39,-0.4,-0.33,-0.33,-0.28,-0.29,-0.34,-0.32,-0.28,-0.32,-0.34,-0.32,-0.33,-0.39,-0.29,-0.32,-0.33,-0.29,-0.34,-0.29,-0.27,-0.25,-0.23,-0.37,-0.46,-0.51,-0.54,-0.52,-0.49,-0.56,-0.56,-0.53,-0.53,-0.41,-0.34,-0.29,-0.3,-0.23,-0.18,-0.14,-0.19,-0.19,-0.25,-0.23,-0.23,-0.16,-0.17,-0.19,-0.07,-0.05,-0.09,-0.09,-0.16,-0.1,-0.11,-0.18,-0.15,-0.13,-0.09,-0.08,-0.11,-0.16,-0.12,-0.15,-0.16,-0.15,-0.15,-0.25,-0.29,-0.38,-0.39,-0.33,-0.44,-0.42,-0.32,-0.4,-0.41,-0.42,-0.5,-0.48,-0.51,-0.54,-0.5,-0.49,-0.53,-0.52,-0.52,-0.52,-0.51,-0.49,-0.46,-0.54,-0.59,-0.66,-0.64,-0.62,-0.63,-0.69,-0.67,-0.68,-0.68,-0.66,-0.64,-0.63,-0.62,-0.54,-0.6,-0.6,-0.68,-0.69,-0.81,-0.81,-0.81,-0.75,-0.76,-0.84,-0.72,-0.63,-0.62,-0.65,-0.64,-0.72,-0.75,-0.8,-0.83,-0.82,-0.84,-0.91,-0.97,-0.85,-0.9,-1.02,-1.04,-1.05,-1.01,-1.0,-0.97,-1.04,-0.98,-1.01,-1.01,-1.08,-1.14,-1.14,-1.11,-1.15,-1.17,-1.2,-1.14,-1.03,-1.08,-1.1,-1.13,-1.05,-1.07,-0.98,-1.05,-0.97,-1.09,-1.03,-1.01,-1.01,-1.1,-1.11,-1.11,-1.13,-1.1,-1.05,-1.03,-1.06,-1.03,-0.99,-1.04,-0.95,-0.91,-0.89,-0.88,-0.92,-0.87,-0.97,-0.99,-0.98,-0.95,-0.9,-0.86,-0.81,-0.82,-0.8,-0.83,-0.92,-0.85,-0.77,-0.87,-0.86,-0.81,-0.91,-0.99,-1.04,-1.01,-1.07,-1.09,-1.06,-1.0,-0.94,-1.0,-0.94,-0.97,-0.93,-0.97,-0.89,-0.92,-0.91,-0.93,-0.97,-0.97,-1.0,-0.95,-0.98,-0.99,-0.96,-0.98,-1.0,-1.06,-1.05,-1.04,-1.05,-1.04,-1.1,-1.09,-1.07,-1.09,-1.12,-1.19,-1.24,-1.31,-1.3,-1.3,-1.28,-1.27,-1.34,-1.33,-1.35,-1.34,-1.29,-1.24,-1.28,-1.24,-1.3,-1.24,-1.23,-1.32,-1.39,-1.37,-1.32,-1.33,-1.43,-1.45,-1.45,-1.43,-1.42,-1.42,-1.39,-1.38,-1.34,-1.43,-1.52,-1.53,-1.58,-1.56,-1.54,-1.54,-1.5,-1.54,-1.53,-1.5,-1.38,-1.42,-1.38,-1.38,-1.36,-1.4,-1.4,-1.44,-1.4,-1.37,-1.41,-1.35,-1.28,-1.32,-1.35,-1.38,-1.37,-1.34,-1.32,-1.32,-1.28,-1.24,-1.21,-1.18,-1.15,-1.12,-1.07,-1.05,-1.02,-0.98,-0.93,-0.88,-0.82,-0.82,-0.8,-0.83,-0.92,-0.85,-0.77,-0.87,-0.86,-0.81,-0.91,-0.99,-1.04,-1.01,-1.07,-1.09,-1.06,-1.0,-0.94,-1.0,-0.94,-0.97,-0.93,-0.97,-0.89,-0.92,-0.91,-0.93,-0.97,-0.97,-1.0,-0.95,-0.98,-0.99,-0.96,-0.98,-1.0,-1.06,-1.05,-1.04,-1.05,-1.04,-1.1,-1.09,-1.07,-1.09,-1.12,-1.19,-1.24],"fills_buy_t":[1,9,12,26,30,32,33,57,58,61,63,75,79,89,116,135,141,145,147,150,155,167,179,182,183,190,202,207,240,243,244,246,257,258,266,281,292,298,299,303,312,313,321,332,336,346,355,359,367,371,373,375,376,385,386,388],"fills_sell_t":[1,4,6,11,48,52,54,58,65,69,71,74,97,99,103,104,105,116,124,162,174,181,194,205,222,226,227,229,230,235,236,264,267,270,275,276,277,286,299,300,310,323,324,325,337,340,348,358,359,376,380,398,399]};
+
+const COLORS = {
+  bg: "#0a0e17",
+  panel: "#111827",
+  border: "#1e293b",
+  text: "#e2e8f0",
+  muted: "#64748b",
+  mid: "#38bdf8",
+  bid: "#22c55e",
+  ask: "#ef4444",
+  pnlUp: "#22c55e",
+  pnlDown: "#ef4444",
+  posLong: "#3b82f6",
+  posShort: "#f97316",
+  fill: "#fbbf24",
+  accent: "#8b5cf6",
+};
+
+const Stat = ({ label, value, color }) => (
+  <div style={{ textAlign: "center" }}>
+    <div style={{ fontSize: 11, color: COLORS.muted, letterSpacing: "0.05em", textTransform: "uppercase", marginBottom: 2 }}>{label}</div>
+    <div style={{ fontSize: 18, fontWeight: 700, color: color || COLORS.text, fontFamily: "'JetBrains Mono', monospace" }}>{value}</div>
+  </div>
+);
+
+const CustomTooltip = ({ active, payload, label }) => {
+  if (!active || !payload?.length) return null;
+  return (
+    <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.border}`, borderRadius: 6, padding: "8px 12px", fontSize: 12, color: COLORS.text }}>
+      <div style={{ color: COLORS.muted, marginBottom: 4 }}>Step {label}</div>
+      {payload.map((p, i) => (
+        <div key={i} style={{ color: p.color, marginBottom: 2 }}>{p.name}: {typeof p.value === "number" ? p.value.toFixed(2) : p.value}</div>
+      ))}
+    </div>
+  );
+};
+
+export default function TradingVisualizer() {
+  const [data, setData] = useState(null);
+  const [cursor, setCursor] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [speed, setSpeed] = useState(50);
+  const timerRef = useRef(null);
+
+  useEffect(() => {
+    // Use embedded demo data
+    const d = DEMO;
+    // Pad arrays to same length
+    const n = d.times.length;
+    const mid = d.mid_prices.slice(0, n);
+    const pos = d.positions.slice(0, n);
+    const cpnl = d.cum_pnl.slice(0, n);
+    // Build bid/ask from mid with spread
+    const bids = mid.map((m, i) => m - (0.1 + Math.sin(i * 0.1) * 0.05 + 0.1) * Math.abs(pos[i] + 1) * 0.02 - 0.15);
+    const asks = mid.map((m, i) => m + (0.1 + Math.cos(i * 0.1) * 0.05 + 0.1) * Math.abs(pos[i] + 1) * 0.02 + 0.15);
+    
+    const chart = d.times.map((t, i) => ({
+      t,
+      mid: mid[i],
+      bid: bids[i],
+      ask: asks[i],
+      pos: pos[i],
+      cpnl: cpnl[i],
+      isBuy: d.fills_buy_t.includes(t),
+      isSell: d.fills_sell_t.includes(t),
+    }));
+    setData({ chart, summary: d.summary, fills_buy_t: new Set(d.fills_buy_t), fills_sell_t: new Set(d.fills_sell_t) });
+    setCursor(n - 1);
+  }, []);
+
+  useEffect(() => {
+    if (playing && data) {
+      timerRef.current = setInterval(() => {
+        setCursor(c => {
+          if (c >= data.chart.length - 1) { setPlaying(false); return c; }
+          return c + 1;
+        });
+      }, Math.max(5, 200 - speed * 2));
+    }
+    return () => clearInterval(timerRef.current);
+  }, [playing, speed, data]);
+
+  const handleFileUpload = useCallback((e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const d = JSON.parse(ev.target.result);
+        const n = d.times.length;
+        const chart = d.times.map((t, i) => ({
+          t,
+          mid: d.mid_prices[i],
+          bid: d.bids[i],
+          ask: d.asks[i],
+          pos: d.positions[i],
+          cpnl: d.cum_pnl[i],
+          isBuy: d.fills_buy_t.includes(t),
+          isSell: d.fills_sell_t.includes(t),
+        }));
+        setData({ chart, summary: d.summary, fills_buy_t: new Set(d.fills_buy_t), fills_sell_t: new Set(d.fills_sell_t) });
+        setCursor(0);
+        setPlaying(false);
+      } catch (err) { console.error(err); }
+    };
+    reader.readAsText(file);
+  }, []);
+
+  if (!data) return <div style={{ color: COLORS.text, padding: 40 }}>Loading...</div>;
+
+  const visible = data.chart.slice(0, cursor + 1);
+  const current = visible[visible.length - 1];
+  const pnlColor = current.cpnl >= 0 ? COLORS.pnlUp : COLORS.pnlDown;
+  const posColor = current.pos > 0 ? COLORS.posLong : current.pos < 0 ? COLORS.posShort : COLORS.muted;
+
+  // Compute visible fill markers
+  const buyMarkers = visible.filter(d => d.isBuy).map(d => ({ t: d.t, price: d.bid, type: "buy" }));
+  const sellMarkers = visible.filter(d => d.isSell).map(d => ({ t: d.t, price: d.ask, type: "sell" }));
+
+  const priceMin = Math.min(...visible.map(d => Math.min(d.bid, d.mid))) - 0.5;
+  const priceMax = Math.max(...visible.map(d => Math.max(d.ask, d.mid))) + 0.5;
+
+  return (
+    <div style={{ background: COLORS.bg, minHeight: "100vh", padding: "16px 20px", fontFamily: "'Inter', -apple-system, sans-serif", color: COLORS.text }}>
+      <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet" />
+
+      {/* Header */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16, borderBottom: `1px solid ${COLORS.border}`, paddingBottom: 12 }}>
+        <div>
+          <h1 style={{ margin: 0, fontSize: 20, fontWeight: 700, letterSpacing: "-0.02em" }}>
+            <span style={{ color: COLORS.accent }}>RL</span> Market Maker
+          </h1>
+          <p style={{ margin: "2px 0 0", fontSize: 11, color: COLORS.muted }}>Out-of-sample simulation playback</p>
+        </div>
+        <label style={{ fontSize: 11, color: COLORS.muted, cursor: "pointer", padding: "6px 12px", border: `1px solid ${COLORS.border}`, borderRadius: 6, background: COLORS.panel }}>
+          Load sim_results.json
+          <input type="file" accept=".json" onChange={handleFileUpload} style={{ display: "none" }} />
+        </label>
+      </div>
+
+      {/* Stats row */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 8, marginBottom: 16 }}>
+        <div style={{ background: COLORS.panel, borderRadius: 8, padding: "10px 8px", border: `1px solid ${COLORS.border}` }}>
+          <Stat label="Step" value={`${current.t} / ${data.chart.length - 1}`} />
+        </div>
+        <div style={{ background: COLORS.panel, borderRadius: 8, padding: "10px 8px", border: `1px solid ${COLORS.border}` }}>
+          <Stat label="Mid Price" value={current.mid.toFixed(2)} color={COLORS.mid} />
+        </div>
+        <div style={{ background: COLORS.panel, borderRadius: 8, padding: "10px 8px", border: `1px solid ${COLORS.border}` }}>
+          <Stat label="Position" value={current.pos} color={posColor} />
+        </div>
+        <div style={{ background: COLORS.panel, borderRadius: 8, padding: "10px 8px", border: `1px solid ${COLORS.border}` }}>
+          <Stat label="Cum PnL" value={current.cpnl.toFixed(2)} color={pnlColor} />
+        </div>
+        <div style={{ background: COLORS.panel, borderRadius: 8, padding: "10px 8px", border: `1px solid ${COLORS.border}` }}>
+          <Stat label="Fills" value={`${buyMarkers.length}B / ${sellMarkers.length}S`} color={COLORS.fill} />
+        </div>
+      </div>
+
+      {/* Price chart with bids/asks */}
+      <div style={{ background: COLORS.panel, borderRadius: 10, border: `1px solid ${COLORS.border}`, padding: "12px 8px 4px", marginBottom: 12 }}>
+        <div style={{ fontSize: 11, color: COLORS.muted, paddingLeft: 12, marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.08em" }}>
+          Price · Bid / Ask Spread
+        </div>
+        <ResponsiveContainer width="100%" height={240}>
+          <ComposedChart data={visible} margin={{ top: 4, right: 12, bottom: 4, left: 4 }}>
+            <XAxis dataKey="t" tick={{ fill: COLORS.muted, fontSize: 10 }} axisLine={{ stroke: COLORS.border }} tickLine={false} />
+            <YAxis domain={[priceMin, priceMax]} tick={{ fill: COLORS.muted, fontSize: 10 }} axisLine={false} tickLine={false} width={45} tickFormatter={v => v.toFixed(0)} />
+            <Tooltip content={<CustomTooltip />} />
+            <Area type="monotone" dataKey="ask" stroke="none" fill={COLORS.ask} fillOpacity={0.08} />
+            <Area type="monotone" dataKey="bid" stroke="none" fill={COLORS.bid} fillOpacity={0.08} />
+            <Line type="monotone" dataKey="ask" stroke={COLORS.ask} strokeWidth={1} dot={false} strokeDasharray="3 3" name="Ask" />
+            <Line type="monotone" dataKey="bid" stroke={COLORS.bid} strokeWidth={1} dot={false} strokeDasharray="3 3" name="Bid" />
+            <Line type="monotone" dataKey="mid" stroke={COLORS.mid} strokeWidth={2} dot={false} name="Mid" />
+            {/* Buy fills */}
+            {buyMarkers.map((m, i) => (
+              <ReferenceLine key={`b${i}`} x={m.t} stroke={COLORS.bid} strokeWidth={1} strokeOpacity={0.3} />
+            ))}
+            {/* Sell fills */}
+            {sellMarkers.map((m, i) => (
+              <ReferenceLine key={`s${i}`} x={m.t} stroke={COLORS.ask} strokeWidth={1} strokeOpacity={0.3} />
+            ))}
+          </ComposedChart>
+        </ResponsiveContainer>
+      </div>
+
+      {/* Position + PnL row */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 16 }}>
+        <div style={{ background: COLORS.panel, borderRadius: 10, border: `1px solid ${COLORS.border}`, padding: "12px 8px 4px" }}>
+          <div style={{ fontSize: 11, color: COLORS.muted, paddingLeft: 12, marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.08em" }}>Position</div>
+          <ResponsiveContainer width="100%" height={140}>
+            <AreaChart data={visible} margin={{ top: 4, right: 12, bottom: 4, left: 4 }}>
+              <XAxis dataKey="t" tick={{ fill: COLORS.muted, fontSize: 9 }} axisLine={{ stroke: COLORS.border }} tickLine={false} />
+              <YAxis tick={{ fill: COLORS.muted, fontSize: 9 }} axisLine={false} tickLine={false} width={30} />
+              <Tooltip content={<CustomTooltip />} />
+              <ReferenceLine y={0} stroke={COLORS.muted} strokeDasharray="2 4" />
+              <Area type="stepAfter" dataKey="pos" stroke={COLORS.posLong} fill={COLORS.posLong} fillOpacity={0.15} strokeWidth={1.5} name="Position" />
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+        <div style={{ background: COLORS.panel, borderRadius: 10, border: `1px solid ${COLORS.border}`, padding: "12px 8px 4px" }}>
+          <div style={{ fontSize: 11, color: COLORS.muted, paddingLeft: 12, marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.08em" }}>Cumulative PnL</div>
+          <ResponsiveContainer width="100%" height={140}>
+            <AreaChart data={visible} margin={{ top: 4, right: 12, bottom: 4, left: 4 }}>
+              <XAxis dataKey="t" tick={{ fill: COLORS.muted, fontSize: 9 }} axisLine={{ stroke: COLORS.border }} tickLine={false} />
+              <YAxis tick={{ fill: COLORS.muted, fontSize: 9 }} axisLine={false} tickLine={false} width={35} tickFormatter={v => v.toFixed(1)} />
+              <Tooltip content={<CustomTooltip />} />
+              <ReferenceLine y={0} stroke={COLORS.muted} strokeDasharray="2 4" />
+              <Area type="monotone" dataKey="cpnl" stroke={pnlColor} fill={pnlColor} fillOpacity={0.12} strokeWidth={1.5} name="Cum PnL" />
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+
+      {/* Playback controls */}
+      <div style={{ background: COLORS.panel, borderRadius: 10, border: `1px solid ${COLORS.border}`, padding: "12px 16px", display: "flex", alignItems: "center", gap: 12 }}>
+        <button
+          onClick={() => { setCursor(0); setPlaying(false); }}
+          style={{ background: "none", border: `1px solid ${COLORS.border}`, borderRadius: 6, color: COLORS.muted, padding: "6px 10px", cursor: "pointer", fontSize: 13 }}
+        >⏮</button>
+        <button
+          onClick={() => setPlaying(!playing)}
+          style={{ background: playing ? COLORS.ask : COLORS.accent, border: "none", borderRadius: 6, color: "#fff", padding: "6px 16px", cursor: "pointer", fontSize: 13, fontWeight: 600 }}
+        >{playing ? "⏸ Pause" : "▶ Play"}</button>
+        <button
+          onClick={() => setCursor(data.chart.length - 1)}
+          style={{ background: "none", border: `1px solid ${COLORS.border}`, borderRadius: 6, color: COLORS.muted, padding: "6px 10px", cursor: "pointer", fontSize: 13 }}
+        >⏭</button>
+
+        <input
+          type="range" min={0} max={data.chart.length - 1} value={cursor}
+          onChange={e => { setCursor(parseInt(e.target.value)); setPlaying(false); }}
+          style={{ flex: 1, accentColor: COLORS.accent }}
+        />
+
+        <div style={{ fontSize: 11, color: COLORS.muted, minWidth: 60 }}>
+          Speed
+          <input type="range" min={1} max={100} value={speed} onChange={e => setSpeed(parseInt(e.target.value))}
+            style={{ width: 60, accentColor: COLORS.accent, marginLeft: 4 }} />
+        </div>
+      </div>
+    </div>
+  );
+}

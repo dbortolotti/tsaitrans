@@ -9,8 +9,8 @@ Model:
     epsilon_{i,t} = rho_i * epsilon_{i,t-1} + sigma_i * xi_{i,t} (idiosyncratic AR(1))
 
 Outputs:
-    data/returns_{tag}.npy      shape: (n_timesteps, n_stocks)  -- NOTE: time first, for convenience
-    data/metadata_{tag}.json    all generation params + SNR per stock
+    returns_{tag}.npy      shape: (n_timesteps, n_stocks)
+    metadata_{tag}.json    all generation params + SNR per stock
 """
 
 import numpy as np
@@ -23,12 +23,10 @@ from datetime import datetime
 def make_stable_matrix(K: int, spectral_radius: float, rng: np.random.Generator) -> np.ndarray:
     """
     Build a K×K matrix with a given spectral radius.
-    This controls how persistent the factors are.
     spectral_radius close to 1 = highly persistent factors (trending)
     spectral_radius close to 0 = fast mean-reverting factors
     """
     A = rng.standard_normal((K, K))
-    # Scale so the largest eigenvalue magnitude equals spectral_radius
     eigenvalues = np.linalg.eigvals(A)
     current_radius = np.max(np.abs(eigenvalues))
     A = A * (spectral_radius / current_radius)
@@ -45,54 +43,47 @@ def generate_factors(
     """
     Simulate factor paths via VAR(1):
         f_t = A @ f_{t-1} + eta_t,  eta_t ~ N(0, sigma_f^2 * I)
-
     Returns: (n_timesteps, K)
     """
     factors = np.zeros((n_timesteps, K))
     factors[0] = rng.standard_normal(K) * sigma_f
-
     for t in range(1, n_timesteps):
         shock = rng.standard_normal(K) * sigma_f
         factors[t] = A @ factors[t - 1] + shock
-
     return factors
 
 
 def generate_idiosyncratic_noise(
     n_timesteps: int,
     n_stocks: int,
-    rho: np.ndarray,   # shape (n_stocks,) — AR(1) persistence per stock
-    sigma: np.ndarray, # shape (n_stocks,) — noise scale per stock
+    rho: np.ndarray,
+    sigma: np.ndarray,
     rng: np.random.Generator,
 ) -> np.ndarray:
     """
     Simulate idiosyncratic noise via AR(1):
         epsilon_{i,t} = rho_i * epsilon_{i,t-1} + sigma_i * xi_{i,t}
-
     Returns: (n_timesteps, n_stocks)
     """
     eps = np.zeros((n_timesteps, n_stocks))
     eps[0] = rng.standard_normal(n_stocks) * sigma
-
     for t in range(1, n_timesteps):
         shock = rng.standard_normal(n_stocks) * sigma
         eps[t] = rho * eps[t - 1] + shock
-
     return eps
 
 
 def compute_snr(
-    loadings: np.ndarray,   # (n_stocks, K)
-    factors: np.ndarray,    # (n_timesteps, K)
-    noise: np.ndarray,      # (n_timesteps, n_stocks)
+    loadings: np.ndarray,
+    factors: np.ndarray,
+    noise: np.ndarray,
 ) -> np.ndarray:
     """
-    Compute per-stock signal-to-noise ratio:
+    Per-stock signal-to-noise ratio:
         SNR_i = Var(lambda_i' f_t) / Var(epsilon_{i,t})
-
     Returns: (n_stocks,)
     """
-    signal = factors @ loadings.T      # (n_timesteps, n_stocks)
+    signal = factors @ loadings.T
     signal_var = np.var(signal, axis=0)
     noise_var = np.var(noise, axis=0)
     return signal_var / (noise_var + 1e-10)
@@ -102,60 +93,48 @@ def generate(
     n_stocks: int = 50,
     n_timesteps: int = 2000,
     n_factors: int = 3,
-    spectral_radius: float = 0.95,  # factor persistence
-    sigma_f: float = 1.0,           # factor shock scale
-    sigma_eps: float = 1.0,         # idiosyncratic noise scale (controls SNR)
-    rho_range: tuple = (0.0, 0.3),  # range of AR(1) persistence across stocks
+    spectral_radius: float = 0.95,
+    sigma_f: float = 1.0,
+    sigma_eps: float = 1.0,
+    rho_range: tuple = (0.0, 0.3),
     seed: int = 42,
 ) -> dict:
-    """
-    Main generation function. Returns a dict with all arrays and metadata.
-    """
+    """Main generation function. Returns a dict with all arrays and metadata."""
     rng = np.random.default_rng(seed)
 
-    # --- Factor transition matrix ---
     A = make_stable_matrix(n_factors, spectral_radius, rng)
-
-    # --- Factor loadings: each stock's sensitivity to each factor ---
-    # Shape: (n_stocks, n_factors)
-    # Normalize rows so no stock has outsized factor exposure by construction
     loadings = rng.standard_normal((n_stocks, n_factors))
-
-    # --- Idiosyncratic AR(1) params per stock ---
     rho = rng.uniform(rho_range[0], rho_range[1], size=n_stocks)
-    sigma = np.full(n_stocks, sigma_eps)  # same scale for all stocks
+    sigma = np.full(n_stocks, sigma_eps)
 
-    # --- Simulate ---
     factors = generate_factors(n_timesteps, n_factors, A, sigma_f, rng)
-    noise   = generate_idiosyncratic_noise(n_timesteps, n_stocks, rho, sigma, rng)
+    noise = generate_idiosyncratic_noise(n_timesteps, n_stocks, rho, sigma, rng)
 
-    # --- Combine: returns = signal + noise ---
-    signal  = factors @ loadings.T   # (n_timesteps, n_stocks)
-    returns = signal + noise          # (n_timesteps, n_stocks)
+    signal = factors @ loadings.T
+    returns = signal + noise
 
-    # --- Compute SNR per stock ---
     snr = compute_snr(loadings, factors, noise)
 
     return {
-        "returns":          returns,   # (n_timesteps, n_stocks) -- this is what you train on
-        "factors":          factors,   # (n_timesteps, n_factors) -- ground truth, don't feed to model
-        "loadings":         loadings,  # (n_stocks, n_factors)    -- ground truth, don't feed to model
-        "noise":            noise,     # (n_timesteps, n_stocks)
-        "A":                A,
-        "rho":              rho,
-        "snr":              snr,
+        "returns": returns,
+        "factors": factors,
+        "loadings": loadings,
+        "noise": noise,
+        "A": A,
+        "rho": rho,
+        "snr": snr,
         "params": {
-            "n_stocks":         n_stocks,
-            "n_timesteps":      n_timesteps,
-            "n_factors":        n_factors,
-            "spectral_radius":  spectral_radius,
-            "sigma_f":          sigma_f,
-            "sigma_eps":        sigma_eps,
-            "rho_range":        list(rho_range),
-            "seed":             seed,
-            "mean_snr":         float(np.mean(snr)),
-            "median_snr":       float(np.median(snr)),
-        }
+            "n_stocks": n_stocks,
+            "n_timesteps": n_timesteps,
+            "n_factors": n_factors,
+            "spectral_radius": spectral_radius,
+            "sigma_f": sigma_f,
+            "sigma_eps": sigma_eps,
+            "rho_range": list(rho_range),
+            "seed": seed,
+            "mean_snr": float(np.mean(snr)),
+            "median_snr": float(np.median(snr)),
+        },
     }
 
 
@@ -163,11 +142,9 @@ def save(result: dict, output_dir: str, tag: str):
     """Save returns array and metadata to disk."""
     os.makedirs(output_dir, exist_ok=True)
 
-    # Save returns (this is what the transformer will consume)
     returns_path = os.path.join(output_dir, f"returns_{tag}.npy")
     np.save(returns_path, result["returns"].astype(np.float32))
 
-    # Save ground truth separately (for analysis, not training)
     gt_path = os.path.join(output_dir, f"ground_truth_{tag}.npz")
     np.savez(
         gt_path,
@@ -179,7 +156,6 @@ def save(result: dict, output_dir: str, tag: str):
         snr=result["snr"],
     )
 
-    # Save metadata as JSON (this is how experiment.py will know sigma_eps, snr, etc.)
     meta_path = os.path.join(output_dir, f"metadata_{tag}.json")
     with open(meta_path, "w") as f:
         json.dump(result["params"], f, indent=2)
@@ -193,22 +169,18 @@ def save(result: dict, output_dir: str, tag: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate synthetic factor model data")
-    parser.add_argument("--n_stocks",        type=int,   default=50)
-    parser.add_argument("--n_timesteps",     type=int,   default=2000)
-    parser.add_argument("--n_factors",       type=int,   default=3)
-    parser.add_argument("--spectral_radius", type=float, default=0.95,
-                        help="Factor persistence (0=no memory, 1=random walk)")
-    parser.add_argument("--sigma_f",         type=float, default=1.0,
-                        help="Factor shock standard deviation")
-    parser.add_argument("--sigma_eps",       type=float, default=1.0,
-                        help="Idiosyncratic noise std. Lower = higher SNR")
-    parser.add_argument("--seed",            type=int,   default=42)
-    parser.add_argument("--output_dir",      type=str,   default="data")
-    parser.add_argument("--tag",             type=str,   default=None,
-                        help="Label for output files. Defaults to timestamp.")
+    parser.add_argument("--n_stocks", type=int, default=50)
+    parser.add_argument("--n_timesteps", type=int, default=2000)
+    parser.add_argument("--n_factors", type=int, default=3)
+    parser.add_argument("--spectral_radius", type=float, default=0.95)
+    parser.add_argument("--sigma_f", type=float, default=1.0)
+    parser.add_argument("--sigma_eps", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--output_dir", type=str, default="data")
+    parser.add_argument("--tag", type=str, default=None)
     args = parser.parse_args()
 
-    tag = args.tag or f"snr{args.sigma_f/args.sigma_eps:.2f}_seed{args.seed}"
+    tag = args.tag or f"snr{args.sigma_f / args.sigma_eps:.2f}_seed{args.seed}"
 
     result = generate(
         n_stocks=args.n_stocks,
