@@ -4,43 +4,49 @@
 
 ---
 
-## Active Topic: Grid Search
+## Active Topic: RL Training Fixes + Grid Search
 
 ### Context
 
-Market env redesign is **implemented and pushed** (2 commits on main). All design docs are up to date:
-- `MARKET_ENV.md` — fill mechanics (aggressive + passive)
-- `RL_DESIGN.md` — reward function, observation space, action space, λ calibration
+First grid search (12 runs on `experiment2`) showed PPO completely failed to train. Diagnosis:
+
+1. **Episode length was wrong** — `seq_len = min(500, T//2)` truncated episodes to 500 steps, but the penalty, terminal cost, and time-remaining obs are calibrated for a full trading day (T=2000). The agent learned wrong flattening behavior at artificial boundaries.
+
+2. **Reward scale broke PPO** — the quadratic inventory penalty produced per-step rewards at O(1-100) while PnL was O(0.01). The critic couldn't fit value targets of O(10^4-10^7), so advantages were meaningless, policy loss stayed ~0, entropy drifted upward, and the agent stayed random. Random agents accumulate positions via random-walk fills, making the penalty worse.
 
 ### What was just done
 
-- Implemented new `market_env.py` with aggressive/passive fills, 4D obs, width/skew actions, time-varying penalty
-- Updated `policy.py`, `train_rl.py`, `simulate.py`, `run_experiment.py`, experiment configs
-- Fixed context_len mismatch bug in `train_rl.py` (was hardcoded, now reads from checkpoint)
-- Added auto-loading of R² from transformer metrics when not set in config
-- Set `half_spread` default to 5bps (0.0005)
-- Smoke-tested full pipeline with `experiments/smoke.json`
-- Created `grid_search.py` — grid search over `n_sigma` and `lambda2` using existing experiment data + transformer
+- **Fixed episode length** — removed `seq_len = min(500, T//2)`, episodes now use full trading day. `make_env_data()` gives each env the complete stock series.
+- **Added `RunningMeanStd`** to `policy.py` — Welford's online algorithm for running mean/variance.
+- **Reward normalization** in `train_rl.py` — rewards divided by running std (no mean subtraction). Critic now sees O(1) targets.
+- **Observation normalization** in `train_rl.py` — obs centered and scaled by running mean/std. All 4 features now O(1) for the tanh trunk.
+- **Normalizer persistence** — saved as `best_normalizer.npz` / `final_normalizer.npz` alongside policy checkpoints. Loaded in `simulate.py` for inference (backward-compatible: falls back to identity if missing).
+- **Updated `grid_search.py`** — `-i`/`-o` flags for input experiment and output name prefix. Runs 10 sims per grid point with seed-stamped files (`sim_results_{seed}.json`). Saves `sim_summary.json` with aggregated stats.
+- **Sim output path** — `simulate.py` now writes to `checkpoints_rl/sim_results_{seed}.json` (was overwriting a single `sim_results.json`).
+- Also committed prior uncommitted fixes: HANDOVER rewrite, `generate_data.py` single-stock vol scaling, `model.py` nested tensor, `half_spread` default 5bps, `market_env.py` EOD cost tracking in cumulative PnL.
 
-### Grid search script (`grid_search.py`)
+### Next step
 
-Reuses an existing experiment's data and trained transformer. Creates `output/<experiment>_grid/ns{n_sigma}_l2{lambda2}/` for each combination. Symlinks data/checkpoints, runs RL + simulation only.
-
-Grid values:
-- `n_sigma`: 0.5, 1.0, 2.0, 3.0
-- `lambda2`: 1.0, 3.0, 5.0
-
-**Status: script written, not yet tested on experiment2.** The user interrupted before the test run. Next step is to run it:
+**Run the grid search** with the fixes and evaluate results:
 
 ```bash
-python grid_search.py output/experiment2 2>&1 | tee log.txt
+python grid_search.py -i output/experiment2 -o grid3 2>&1 | tee log_grid3.txt
 ```
 
-`output/experiment2` exists with trained transformer (R²=0.558, SNR=1.0, 95 stocks, 2000 steps).
+`output/experiment2` has trained transformer (R²=0.558, SNR=1.0, 95 stocks, 2000 steps).
 
-### Known issue
+### What to look for
 
-`simulate.py` generates a fresh stock for visualization. With `n_stocks=1` and certain DGP params, `generate_data.py` can produce NaN (divide-by-zero in vol scaling). This is a pre-existing bug in single-stock generation, not related to the env redesign. Only affects simulation, not training.
+- Value loss should drop to O(1-10) instead of O(10^4-10^7)
+- Policy loss should be non-zero and move
+- Entropy should decrease (policy becoming less random)
+- `reward_std` in logs should adapt over iterations
+- Avg |position| in sims should be much smaller (was 13-159 in broken runs)
+- PnL should show differentiation across `n_sigma` × `lambda2` grid
+
+### Known issue (pre-existing)
+
+`simulate.py` generates a fresh stock via `generate_data.py` with `n_stocks=1`. With certain DGP params, this can produce NaN (divide-by-zero in vol scaling). Only affects simulation, not training. The `generate_data.py` fix handles the single-stock case by skipping the empirical daily vol correction.
 
 ---
 
@@ -75,7 +81,7 @@ python grid_search.py output/experiment2 2>&1 | tee log.txt
 python run_experiment.py experiments/example.json
 
 # Grid search (RL only, reuses existing data + transformer)
-python grid_search.py output/experiment2 2>&1 | tee log.txt
+python grid_search.py -i output/experiment2 -o grid3 2>&1 | tee log_grid3.txt
 
 # Smoke test (fast, tiny config)
 python run_experiment.py experiments/smoke.json
