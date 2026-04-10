@@ -5,8 +5,20 @@ Generates synthetic stock return data from a latent factor model.
 
 Model:
     x_{i,t} = lambda_i' @ f_t + epsilon_{i,t}        (observation equation)
-    f_t = A @ f_{t-1} + eta_t,  eta_t ~ N(0, Sigma_f) (factor dynamics, VAR(1))
-    epsilon_{i,t} = rho_i * epsilon_{i,t-1} + sigma_i * xi_{i,t} (idiosyncratic AR(1))
+    f_t = A @ f_{t-1} + eta_t,  eta_t ~ N(0, I)      (factor dynamics, VAR(1))
+    epsilon_{i,t} = rho_i * epsilon_{i,t-1} + xi_{i,t} (idiosyncratic AR(1))
+
+Primary parameters:
+    target_vol          — daily volatility (std of cumulative return over one day)
+    snr                 — signal variance / noise variance
+    factor_half_life    — factor mean-reversion half-life as fraction of a trading day
+    noise_half_life_range — (min, max) idiosyncratic half-life as fraction of a trading day
+    n_factors           — dimensionality of the shared signal space
+    steps_per_day       — number of timesteps in one trading day
+
+Per-step parameters are derived from the half-lives:
+    spectral_radius = 0.5 ** (1 / (factor_half_life * steps_per_day))
+    rho_i           = 0.5 ** (1 / (noise_half_life_i * steps_per_day))
 
 Outputs:
     returns_{tag}.npy      shape: (n_timesteps, n_stocks)
@@ -93,27 +105,56 @@ def generate(
     n_stocks: int = 50,
     n_timesteps: int = 2000,
     n_factors: int = 3,
-    spectral_radius: float = 0.95,
-    sigma_f: float = 1.0,
-    sigma_eps: float = 1.0,
-    rho_range: tuple = (0.0, 0.3),
+    factor_half_life: float = 0.1,
+    noise_half_life_range: tuple = (0.005, 0.025),
+    target_vol: float = 0.02,
+    snr: float = 0.3,
+    steps_per_day: int = 2000,
     seed: int = 42,
 ) -> dict:
-    """Main generation function. Returns a dict with all arrays and metadata."""
+    """
+    Main generation function. Returns a dict with all arrays and metadata.
+
+    factor_half_life and noise_half_life_range are expressed as fractions of a
+    trading day. Per-step AR parameters are derived as:
+        spectral_radius = 0.5 ** (1 / (factor_half_life * steps_per_day))
+        rho_i           = 0.5 ** (1 / (noise_half_life_i * steps_per_day))
+
+    target_vol is the DAILY volatility (std of cumulative return over one day).
+    Per-step vol = target_vol / sqrt(steps_per_day).
+    """
     rng = np.random.default_rng(seed)
+
+    # Derive per-step persistence parameters from half-lives
+    spectral_radius = 0.5 ** (1.0 / (factor_half_life * steps_per_day))
+    hl_low, hl_high = noise_half_life_range
+    rho_low  = 0.5 ** (1.0 / (hl_low  * steps_per_day))
+    rho_high = 0.5 ** (1.0 / (hl_high * steps_per_day))
 
     A = make_stable_matrix(n_factors, spectral_radius, rng)
     loadings = rng.standard_normal((n_stocks, n_factors))
-    rho = rng.uniform(rho_range[0], rho_range[1], size=n_stocks)
-    sigma = np.full(n_stocks, sigma_eps)
+    rho = rng.uniform(rho_low, rho_high, size=n_stocks)
 
-    factors = generate_factors(n_timesteps, n_factors, A, sigma_f, rng)
-    noise = generate_idiosyncratic_noise(n_timesteps, n_stocks, rho, sigma, rng)
-
+    # Generate at unit scale
+    factors = generate_factors(n_timesteps, n_factors, A, sigma_f=1.0, rng=rng)
+    noise = generate_idiosyncratic_noise(n_timesteps, n_stocks, rho, sigma=np.ones(n_stocks), rng=rng)
     signal = factors @ loadings.T
+
+    # Per-step vol targets: daily vol scaled down by sqrt(steps_per_day)
+    per_step_vol = target_vol / np.sqrt(steps_per_day)
+    sigma_signal_target = per_step_vol * np.sqrt(snr / (1.0 + snr))
+    sigma_noise_target  = per_step_vol / np.sqrt(1.0 + snr)
+
+    signal_scale = sigma_signal_target / np.std(signal)
+    noise_scale  = sigma_noise_target  / np.std(noise)
+
+    signal  = signal  * signal_scale
+    factors = factors * signal_scale   # keep factors consistent with signal
+    noise   = noise   * noise_scale
+
     returns = signal + noise
 
-    snr = compute_snr(loadings, factors, noise)
+    empirical_snr = compute_snr(loadings, factors, noise)
 
     return {
         "returns": returns,
@@ -122,18 +163,23 @@ def generate(
         "noise": noise,
         "A": A,
         "rho": rho,
-        "snr": snr,
+        "snr": empirical_snr,
         "params": {
             "n_stocks": n_stocks,
             "n_timesteps": n_timesteps,
             "n_factors": n_factors,
-            "spectral_radius": spectral_radius,
-            "sigma_f": sigma_f,
-            "sigma_eps": sigma_eps,
-            "rho_range": list(rho_range),
+            "factor_half_life": factor_half_life,
+            "noise_half_life_range": list(noise_half_life_range),
+            "derived_spectral_radius": spectral_radius,
+            "derived_rho_range": [float(rho_low), float(rho_high)],
+            "target_vol": target_vol,
+            "snr": snr,
+            "steps_per_day": steps_per_day,
             "seed": seed,
-            "mean_snr": float(np.mean(snr)),
-            "median_snr": float(np.median(snr)),
+            "empirical_per_step_vol": float(np.std(returns)),
+            "empirical_daily_vol": float(np.std(returns) * np.sqrt(steps_per_day)),
+            "mean_snr": float(np.mean(empirical_snr)),
+            "median_snr": float(np.median(empirical_snr)),
         },
     }
 
@@ -172,23 +218,28 @@ if __name__ == "__main__":
     parser.add_argument("--n_stocks", type=int, default=50)
     parser.add_argument("--n_timesteps", type=int, default=2000)
     parser.add_argument("--n_factors", type=int, default=3)
-    parser.add_argument("--spectral_radius", type=float, default=0.95)
-    parser.add_argument("--sigma_f", type=float, default=1.0)
-    parser.add_argument("--sigma_eps", type=float, default=1.0)
+    parser.add_argument("--factor_half_life", type=float, default=0.1)
+    parser.add_argument("--noise_half_life_min", type=float, default=0.005)
+    parser.add_argument("--noise_half_life_max", type=float, default=0.025)
+    parser.add_argument("--target_vol", type=float, default=0.02)
+    parser.add_argument("--snr", type=float, default=0.3)
+    parser.add_argument("--steps_per_day", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", type=str, default="data")
     parser.add_argument("--tag", type=str, default=None)
     args = parser.parse_args()
 
-    tag = args.tag or f"snr{args.sigma_f / args.sigma_eps:.2f}_seed{args.seed}"
+    tag = args.tag or f"vol{args.target_vol}_snr{args.snr}_fhl{args.factor_half_life}_seed{args.seed}"
 
     result = generate(
         n_stocks=args.n_stocks,
         n_timesteps=args.n_timesteps,
         n_factors=args.n_factors,
-        spectral_radius=args.spectral_radius,
-        sigma_f=args.sigma_f,
-        sigma_eps=args.sigma_eps,
+        factor_half_life=args.factor_half_life,
+        noise_half_life_range=(args.noise_half_life_min, args.noise_half_life_max),
+        target_vol=args.target_vol,
+        snr=args.snr,
+        steps_per_day=args.steps_per_day,
         seed=args.seed,
     )
 

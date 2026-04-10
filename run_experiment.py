@@ -28,21 +28,22 @@ import numpy as np
 
 DEFAULTS = {
     "data": {
-        "sigma_eps": 1.0,
-        "n_steps": 2000,
+        "target_vol": 0.02,
+        "snr": 0.3,
+        "factor_half_life": 0.1,
+        "noise_half_life_range": [0.005, 0.025],
         "n_factors": 3,
-        "spectral_radius": 0.95,
-        "sigma_f": 1.0,
-        "rho_range": [0.0, 0.3],
+        "steps_per_day": 2000,
+        "n_steps": 2000,
         "seed": 42,
-        "stocks_transformer_train": 3,
-        "stocks_transformer_val": 2,
-        "stocks_rl_train": 2,
-        "stocks_rl_val": 2,
-        "stocks_test": 1,
+        "stocks_transformer_train": 20,
+        "stocks_transformer_val": 5,
+        "stocks_rl_train": 10,
+        "stocks_rl_val": 3,
+        "stocks_test": 5,
     },
     "transformer": {
-        "context_len": 60,
+        "context_len": 200,
         "horizon": 1,
         "d_model": 64,
         "n_heads": 4,
@@ -51,8 +52,8 @@ DEFAULTS = {
         "dropout": 0.1,
         "batch_size": 128,
         "lr": 3e-4,
-        "n_epochs": 50,
-        "patience": 10,
+        "n_epochs": 100,
+        "patience": 15,
         "seed": 42,
     },
     "rl": {
@@ -153,16 +154,17 @@ def main(config_path: str):
 
     from generate_data import generate, save
 
-    rho_range = data_cfg.get("rho_range", [0.0, 0.3])
+    n_steps = data_cfg["n_steps"]
     result = generate(
         n_stocks=n_stocks,
-        n_timesteps=data_cfg.get("n_steps", 2000),
-        n_factors=data_cfg.get("n_factors", 3),
-        spectral_radius=data_cfg.get("spectral_radius", 0.95),
-        sigma_f=data_cfg.get("sigma_f", 1.0),
-        sigma_eps=data_cfg.get("sigma_eps", 1.0),
-        rho_range=tuple(rho_range),
-        seed=data_cfg.get("seed", 42),
+        n_timesteps=n_steps,
+        n_factors=data_cfg["n_factors"],
+        factor_half_life=data_cfg["factor_half_life"],
+        noise_half_life_range=tuple(data_cfg["noise_half_life_range"]),
+        target_vol=data_cfg["target_vol"],
+        snr=data_cfg["snr"],
+        steps_per_day=data_cfg["steps_per_day"],
+        seed=data_cfg["seed"],
     )
 
     data_dir = os.path.join(output_dir, "data")

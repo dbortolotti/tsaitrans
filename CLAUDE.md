@@ -32,14 +32,18 @@ Individual scripts can still be run standalone — see their `--help` for args.
 ```json
 {
   "data": {
-    "sigma_eps": 0.5,
-    "n_steps": 2000,
+    "target_vol": 0.02,
+    "snr": 0.3,
+    "factor_half_life": 0.1,
+    "noise_half_life_range": [0.005, 0.025],
     "n_factors": 3,
-    "stocks_transformer_train": 3,
-    "stocks_transformer_val": 2,
-    "stocks_rl_train": 2,
-    "stocks_rl_val": 2,
-    "stocks_test": 1
+    "steps_per_day": 2000,
+    "n_steps": 2000,
+    "stocks_transformer_train": 20,
+    "stocks_transformer_val": 5,
+    "stocks_rl_train": 10,
+    "stocks_rl_val": 3,
+    "stocks_test": 5
   },
   "transformer": {
     "d_model": 64, "n_heads": 4, "n_layers": 3,
@@ -53,6 +57,8 @@ Individual scripts can still be run standalone — see their `--help` for args.
 }
 ```
 
+See `DATA_MODEL.md` for the full model spec, parameter interpretation, and calibration discussion.
+
 ## Architecture
 
 ### Prediction (`prediction/`)
@@ -60,7 +66,7 @@ Individual scripts can still be run standalone — see their `--help` for args.
 **Pipeline: generate_data.py → train.py → inference.py**, with `model.py` as shared module.
 
 - **`model.py`** — `TimeSeriesDataset` (per-stock sliding windows, univariate), `FactorTransformer` (linear projection → sinusoidal PE → TransformerEncoder → linear head, n_stocks=1), `get_device()`, `make_splits()` (stock-based train/val/test with train-only normalization)
-- **`generate_data.py`** — Latent factor model: observations = loadings × VAR(1) factors + AR(1) noise. Loadings are ground truth only, never model input.
+- **`generate_data.py`** — Latent factor model: observations = loadings × VAR(1) factors + AR(1) noise. Signal and noise are rescaled to hit `target_vol` and `snr`. Loadings are ground truth only, never model input.
 - **`train.py`** — AdamW + cosine LR with warmup + early stopping + grad clipping.
 - **`inference.py`** — Loads checkpoint + normalization stats, computes metrics on test stocks, saves plots.
 
