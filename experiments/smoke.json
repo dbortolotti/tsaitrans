@@ -1,0 +1,28 @@
+{
+  "data": {
+    "n_steps": 500,
+    "steps_per_day": 500,
+    "stocks_transformer_train": 3,
+    "stocks_transformer_val": 2,
+    "stocks_rl_train": 2,
+    "stocks_rl_val": 1,
+    "stocks_test": 1
+  },
+  "transformer": {
+    "context_len": 20,
+    "d_model": 16,
+    "n_heads": 2,
+    "n_layers": 1,
+    "n_epochs": 3,
+    "patience": 3,
+    "batch_size": 32
+  },
+  "rl": {
+    "n_envs": 4,
+    "n_iterations": 3,
+    "rollout_steps": 64,
+    "half_spread": 0.001,
+    "n_sigma": 1.0,
+    "lambda2": 1.5
+  }
+}

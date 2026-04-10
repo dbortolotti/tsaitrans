@@ -28,7 +28,7 @@ from market_env import MarketMakingEnv, VectorizedMarketEnv
 from policy import ActorCritic, RolloutBuffer, ppo_update
 
 
-def load_transformer_predictions(returns, stock_indices, checkpoint_dir, context_len=60):
+def load_transformer_predictions(returns, stock_indices, checkpoint_dir):
     """
     Load trained univariate transformer and generate predictions for specified stocks.
     Returns (T, len(stock_indices)) array of predicted next-step returns in normalized space.
@@ -70,14 +70,15 @@ def load_transformer_predictions(returns, stock_indices, checkpoint_dir, context
 
         T = returns.shape[0]
         predictions = np.zeros((T, len(stock_indices)))
+        ctx_len = config.get("context_len", 60)
 
         # Predictions stay in normalized space (O(1) magnitude)
         with torch.no_grad():
             for si, stock_idx in enumerate(stock_indices):
                 series = returns[:, stock_idx]
                 normed = (series - mean) / std
-                for t in range(context_len, T):
-                    window = normed[t - context_len : t].reshape(1, context_len, 1)
+                for t in range(ctx_len, T):
+                    window = normed[t - ctx_len : t].reshape(1, ctx_len, 1)
                     x = torch.tensor(window, dtype=torch.float32, device=device)
                     pred = model(x)  # (1, 1, 1)
                     predictions[t, si] = pred[0, 0, 0].item()
@@ -177,7 +178,20 @@ def train(
     # New env parameters
     half_spread = config.get("half_spread", 0.001)
     target_vol = config.get("target_vol", 0.02)
-    r_squared = config.get("r_squared", 0.01)
+
+    # Auto-load R² from transformer metrics if not explicitly set
+    r_squared = config.get("r_squared", None)
+    if r_squared is None and transformer_checkpoint:
+        # metrics.json lives in results/ sibling to checkpoints/
+        experiment_dir = os.path.dirname(transformer_checkpoint)
+        metrics_path = os.path.join(experiment_dir, "results", "metrics.json")
+        if os.path.exists(metrics_path):
+            with open(metrics_path) as f:
+                metrics = json.load(f)
+            r_squared = max(metrics.get("r2_vs_naive", 0.01), 1e-4)
+            print(f"[INFO] Auto-loaded R²={r_squared:.4f} from transformer metrics")
+    if r_squared is None:
+        r_squared = 0.01
     n_sigma = config.get("n_sigma", 1.0)
     tau = config.get("tau", 20)
     lambda2 = config.get("lambda2", 1.5)

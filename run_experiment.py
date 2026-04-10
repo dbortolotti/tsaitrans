@@ -66,7 +66,6 @@ DEFAULTS = {
         "gae_lambda": 0.95,
         "half_spread": 0.001,
         "target_vol": 0.02,
-        "r_squared": 0.01,
         "n_sigma": 1.0,
         "tau": 20,
         "lambda2": 1.5,
