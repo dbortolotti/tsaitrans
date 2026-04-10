@@ -160,8 +160,19 @@ function TradingVisualizer() {
   const buyMarkers = visible.filter(d => d.isBuy).map(d => ({ t: d.t, price: d.bid, type: "buy" }));
   const sellMarkers = visible.filter(d => d.isSell).map(d => ({ t: d.t, price: d.ask, type: "sell" }));
 
-  const priceMin = Math.min(...visible.map(d => Math.min(d.bid, d.mid))) - 0.5;
-  const priceMax = Math.max(...visible.map(d => Math.max(d.ask, d.mid))) + 0.5;
+  // Full-width chart data: null out values beyond cursor so x-axis stays fixed
+  const fullData = data.chart.map((d, i) => i <= cursor
+    ? d
+    : { t: d.t, mid: null, bid: null, ask: null, pos: null, cpnl: null }
+  );
+
+  // Y domains fixed to full data range so axes don't jump during playback
+  const priceMin = Math.min(...data.chart.map(d => Math.min(d.bid, d.mid))) - 0.5;
+  const priceMax = Math.max(...data.chart.map(d => Math.max(d.ask, d.mid))) + 0.5;
+  const posMin = Math.min(...data.chart.map(d => d.pos));
+  const posMax = Math.max(...data.chart.map(d => d.pos));
+  const pnlMin = Math.min(...data.chart.map(d => d.cpnl));
+  const pnlMax = Math.max(...data.chart.map(d => d.cpnl));
 
   return (
     <div style={{ background: COLORS.bg, minHeight: "100vh", padding: "16px 20px", fontFamily: "'Inter', -apple-system, sans-serif", color: COLORS.text }}>
@@ -220,7 +231,7 @@ function TradingVisualizer() {
           Price · Bid / Ask Spread
         </div>
         <ResponsiveContainer width="100%" height={240}>
-          <ComposedChart data={visible} margin={{ top: 4, right: 12, bottom: 4, left: 4 }}>
+          <ComposedChart data={fullData} margin={{ top: 4, right: 12, bottom: 4, left: 4 }}>
             <XAxis dataKey="t" tick={{ fill: COLORS.muted, fontSize: 10 }} axisLine={{ stroke: COLORS.border }} tickLine={false} />
             <YAxis domain={[priceMin, priceMax]} tick={{ fill: COLORS.muted, fontSize: 10 }} axisLine={false} tickLine={false} width={45} tickFormatter={v => v.toFixed(0)} />
             <Tooltip content={<CustomTooltip />} />
@@ -244,9 +255,9 @@ function TradingVisualizer() {
         <div style={{ background: COLORS.panel, borderRadius: 10, border: `1px solid ${COLORS.border}`, padding: "12px 8px 4px" }}>
           <div style={{ fontSize: 11, color: COLORS.muted, paddingLeft: 12, marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.08em" }}>Position</div>
           <ResponsiveContainer width="100%" height={140}>
-            <AreaChart data={visible} margin={{ top: 4, right: 12, bottom: 4, left: 4 }}>
+            <AreaChart data={fullData} margin={{ top: 4, right: 12, bottom: 4, left: 4 }}>
               <XAxis dataKey="t" tick={{ fill: COLORS.muted, fontSize: 9 }} axisLine={{ stroke: COLORS.border }} tickLine={false} />
-              <YAxis tick={{ fill: COLORS.muted, fontSize: 9 }} axisLine={false} tickLine={false} width={30} />
+              <YAxis domain={[posMin, posMax]} tick={{ fill: COLORS.muted, fontSize: 9 }} axisLine={false} tickLine={false} width={30} />
               <Tooltip content={<CustomTooltip />} />
               <ReferenceLine y={0} stroke={COLORS.muted} strokeDasharray="2 4" />
               <Area type="stepAfter" dataKey="pos" stroke={COLORS.posLong} fill={COLORS.posLong} fillOpacity={0.15} strokeWidth={1.5} name="Position" />
@@ -256,9 +267,9 @@ function TradingVisualizer() {
         <div style={{ background: COLORS.panel, borderRadius: 10, border: `1px solid ${COLORS.border}`, padding: "12px 8px 4px" }}>
           <div style={{ fontSize: 11, color: COLORS.muted, paddingLeft: 12, marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.08em" }}>Cumulative PnL</div>
           <ResponsiveContainer width="100%" height={140}>
-            <AreaChart data={visible} margin={{ top: 4, right: 12, bottom: 4, left: 4 }}>
+            <AreaChart data={fullData} margin={{ top: 4, right: 12, bottom: 4, left: 4 }}>
               <XAxis dataKey="t" tick={{ fill: COLORS.muted, fontSize: 9 }} axisLine={{ stroke: COLORS.border }} tickLine={false} />
-              <YAxis tick={{ fill: COLORS.muted, fontSize: 9 }} axisLine={false} tickLine={false} width={35} tickFormatter={v => v.toFixed(1)} />
+              <YAxis domain={[pnlMin, pnlMax]} tick={{ fill: COLORS.muted, fontSize: 9 }} axisLine={false} tickLine={false} width={35} tickFormatter={v => v.toFixed(1)} />
               <Tooltip content={<CustomTooltip />} />
               <ReferenceLine y={0} stroke={COLORS.muted} strokeDasharray="2 4" />
               <Area type="monotone" dataKey="cpnl" stroke={pnlColor} fill={pnlColor} fillOpacity={0.12} strokeWidth={1.5} name="Cum PnL" />

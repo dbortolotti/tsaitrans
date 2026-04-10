@@ -19,7 +19,7 @@ class ActorCritic(nn.Module):
     Log-std is a learnable parameter (state-independent).
     """
 
-    def __init__(self, obs_dim=5, act_dim=2, hidden=64):
+    def __init__(self, obs_dim=4, act_dim=2, hidden=64):
         super().__init__()
 
         self.trunk = nn.Sequential(

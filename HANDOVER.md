@@ -1,3 +1,57 @@
+# Handover: Market Env Redesign (active topic)
+
+> **Session handover** — pick up from "Market Env Redesign" section below before reading the rest.
+
+---
+
+## Active Topic: Market Env Redesign
+
+### What has been decided (this session)
+
+The fill mechanics are fully designed and documented in `MARKET_ENV.md`. Key decisions:
+
+**Entities:**
+- DGP generates mid prices. Market has fixed `half_spread` parameter.
+- bm(t) = mid(t) − half_spread, om(t) = mid(t) + half_spread
+- Agent posts bid b(t) and offer o(t) each step
+
+**Two fill types, checked independently each step:**
+
+1. **Aggressive fill** — agent's current quote crosses current market. Filled at market price (taker, pays spread).
+   - b(t) >= om(t) → buy at om(t)
+   - o(t) <= bm(t) → sell at bm(t)
+
+2. **Passive fill** — agent's previous resting quote crossed by current market. Filled at agent's quoted price (maker, earns spread).
+   - om(t) <= b(t-1) → buy at b(t-1)
+   - bm(t) >= o(t-1) → sell at o(t-1)
+
+**Fill multiplicity:** All four conditions checked independently. Any/all that fire execute. Same-side double fills (e.g. aggressive buy + passive buy) both happen. Position constraints (none currently) are enforced pre-trade — order not submitted, so fill condition never checked.
+
+**Reward function** (fully designed, see `RL_DESIGN.md`):
+- Per-step: `reward(t) = mark_to_market_pnl(t) − (n · l(t) · position)²`
+- `l(t) = 1 / (R² · sqrt(max(T - t, τ)))` — time-varying, tightens as day progresses
+- Terminal: `λ2 · |position| · half_spread` — EOD forced liquidation cost
+- Parameters: `R²` (measured), `n` (risk tolerance, single tuning knob), `τ` (floor, ~10-50), `λ2` (>=1)
+
+**Observation space** (4D, see `RL_DESIGN.md`):
+1. Predicted move: `prediction * price` (dollars)
+2. Position risk: `position * target_vol * price` (dollars)
+3. Time remaining: `(T - t) / T`
+4. Cumulative PnL (dollars)
+
+All prices scaled by initial price (start at 1.0). No rolling vol, no last return, no inventory age — all redundant given these 4 features. `target_vol` replaces `return_scale` (which was a look-ahead bug).
+
+**Action space** (2D, see `RL_DESIGN.md`):
+- Width `w ∈ [0, max_width]` — symmetric quote distance in `half_spread` multiples. Width >= 0 prevents double-side aggression.
+- Skew `s ∈ [-max_skew, max_skew]` — directional shift in `half_spread` multiples.
+- `b(t) = mid(t) - w·half_spread + s·half_spread`
+- `o(t) = mid(t) + w·half_spread + s·half_spread`
+
+### Next step
+**Implement** — refactor `placing/market_env.py`, `placing/train_rl.py`, `placing/policy.py`, `simulate.py` to match the new design. All design details in `RL_DESIGN.md` and `MARKET_ENV.md`.
+
+---
+
 # Handover: Transformer + RL Market Making Experiment
 
 ## What This Is

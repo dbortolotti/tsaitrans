@@ -122,7 +122,7 @@ def train(
     Train the RL market-making agent.
 
     Args:
-        config: RL hyperparams (lr, lambda_inv, kappa_spread, etc.)
+        config: RL hyperparams (half_spread, n_sigma, etc.)
         returns: (T, N_total) full returns array
         stock_split: dict with 'rl_train', 'rl_val', 'test' keys
         save_dir: where to save RL checkpoints
@@ -138,7 +138,6 @@ def train(
     print(f"[INFO] RL val stocks:   {rl_val_stocks}")
 
     # Get predictions and normalization stats
-    # Everything fed to the env is in normalized space (O(1) magnitude)
     predictor = config.get("predictor", "transformer")
     norm_mean, norm_std = None, None
 
@@ -165,8 +164,6 @@ def train(
         predictions = momentum_predictor(returns, rl_train_stocks, norm_mean, norm_std)
         print("[INFO] Using momentum predictor")
 
-    # Normalize returns for the env (same stats as transformer)
-    returns_normed = (returns - norm_mean) / norm_std
     print(f"[INFO] Normalization: mean={norm_mean:.4f}, std={norm_std:.4f}")
 
     # Extract config
@@ -176,9 +173,16 @@ def train(
     lr = config.get("lr", 3e-4)
     gamma = config.get("gamma", 0.99)
     lam = config.get("gae_lambda", 0.95)
-    lambda_inventory = config.get("lambda_inv", 0.01)
-    kappa_spread = config.get("kappa_spread", 0.0005)
-    max_position = config.get("max_position", 10)
+
+    # New env parameters
+    half_spread = config.get("half_spread", 0.001)
+    target_vol = config.get("target_vol", 0.02)
+    r_squared = config.get("r_squared", 0.01)
+    n_sigma = config.get("n_sigma", 1.0)
+    tau = config.get("tau", 20)
+    lambda2 = config.get("lambda2", 1.5)
+    max_width = config.get("max_width", 3.0)
+    max_skew = config.get("max_skew", 3.0)
 
     T = returns.shape[0]
     n_rl_stocks = len(rl_train_stocks)
@@ -191,10 +195,9 @@ def train(
         ret_list, pred_list = [], []
         rng = np.random.default_rng()
         for _ in range(n):
-            # Pick a random RL train stock
             si = rng.integers(0, n_rl_stocks)
             stock_idx = rl_train_stocks[si]
-            stock_returns = returns_normed[:, stock_idx]
+            stock_returns = returns[:, stock_idx]
             stock_preds = predictions[:, si]
 
             start = rng.integers(0, T - seq_len)
@@ -203,11 +206,13 @@ def train(
         return ret_list, pred_list
 
     # Policy
-    policy = ActorCritic(obs_dim=5, act_dim=2, hidden=64).to(device)
+    policy = ActorCritic(obs_dim=4, act_dim=2, hidden=64).to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=lr, eps=1e-5)
 
     n_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     print(f"[INFO] Policy parameters: {n_params:,}")
+    print(f"[INFO] Env params: half_spread={half_spread}, target_vol={target_vol}, "
+          f"R²={r_squared}, n_sigma={n_sigma}, tau={tau}, lambda2={lambda2}")
 
     os.makedirs(save_dir, exist_ok=True)
 
@@ -228,9 +233,14 @@ def train(
         vec_env = VectorizedMarketEnv(
             ret_list,
             pred_list,
-            lambda_inventory=lambda_inventory,
-            kappa_spread=kappa_spread,
-            max_position=max_position,
+            half_spread=half_spread,
+            target_vol=target_vol,
+            r_squared=r_squared,
+            n_sigma=n_sigma,
+            tau=tau,
+            lambda2=lambda2,
+            max_width=max_width,
+            max_skew=max_skew,
         )
 
         buffer = RolloutBuffer()
@@ -307,9 +317,12 @@ if __name__ == "__main__":
     parser.add_argument("--n_iterations", type=int, default=200)
     parser.add_argument("--rollout_steps", type=int, default=512)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--lambda_inv", type=float, default=0.01)
-    parser.add_argument("--kappa_spread", type=float, default=0.0005)
-    parser.add_argument("--max_position", type=int, default=10)
+    parser.add_argument("--half_spread", type=float, default=0.001)
+    parser.add_argument("--target_vol", type=float, default=0.02)
+    parser.add_argument("--r_squared", type=float, default=0.01)
+    parser.add_argument("--n_sigma", type=float, default=1.0)
+    parser.add_argument("--tau", type=int, default=20)
+    parser.add_argument("--lambda2", type=float, default=1.5)
     args = parser.parse_args()
 
     returns = np.load(args.data)

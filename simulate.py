@@ -50,15 +50,15 @@ def main(experiment_dir: str, seed: int = None, deterministic: bool = False):
     # --- Generate a single fresh stock ---
     from generate_data import generate
 
-    rho_range = data_cfg.get("rho_range", [0.0, 0.05])
     result = generate(
         n_stocks=1,  # just one stock for simulation
         n_timesteps=data_cfg.get("n_steps", 2000),
         n_factors=data_cfg.get("n_factors", 3),
-        spectral_radius=data_cfg.get("spectral_radius", 0.7),
+        factor_half_life=data_cfg.get("factor_half_life", 0.1),
+        noise_half_life_range=tuple(data_cfg.get("noise_half_life_range", [0.005, 0.025])),
         target_vol=data_cfg.get("target_vol", 0.02),
-        snr=data_cfg.get("snr", 1.0),
-        rho_range=tuple(rho_range),
+        snr=data_cfg.get("snr", 0.3),
+        steps_per_day=data_cfg.get("steps_per_day", 2000),
         seed=seed,
     )
     returns_raw = result["returns"][:, 0].astype(np.float32)  # (T,)
@@ -119,7 +119,7 @@ def main(experiment_dir: str, seed: int = None, deterministic: bool = False):
     from policy import ActorCritic
 
     rl_dir = os.path.join(experiment_dir, "checkpoints_rl")
-    policy = ActorCritic(obs_dim=5, act_dim=2, hidden=64).to(device)
+    policy = ActorCritic(obs_dim=4, act_dim=2, hidden=64).to(device)
 
     policy_path = os.path.join(rl_dir, "best_policy.pt")
     if not os.path.exists(policy_path):
@@ -131,16 +131,17 @@ def main(experiment_dir: str, seed: int = None, deterministic: bool = False):
     # --- Run simulation using MarketMakingEnv ---
     from market_env import MarketMakingEnv
 
-    lambda_inv = rl_cfg.get("lambda_inv", 0.01)
-    kappa_spread = rl_cfg.get("kappa_spread", 0.0005)
-    max_position = rl_cfg.get("max_position", 10)
-
     env = MarketMakingEnv(
-        returns=returns_normed,
+        returns=returns_raw,
         predictions=predictions,
-        lambda_inventory=lambda_inv,
-        kappa_spread=kappa_spread,
-        max_position=max_position,
+        half_spread=rl_cfg.get("half_spread", 0.001),
+        target_vol=data_cfg.get("target_vol", 0.02),
+        r_squared=rl_cfg.get("r_squared", 0.01),
+        n_sigma=rl_cfg.get("n_sigma", 1.0),
+        tau=rl_cfg.get("tau", 20),
+        lambda2=rl_cfg.get("lambda2", 1.5),
+        max_width=rl_cfg.get("max_width", 3.0),
+        max_skew=rl_cfg.get("max_skew", 3.0),
     )
 
     obs, _ = env.reset()
@@ -157,8 +158,7 @@ def main(experiment_dir: str, seed: int = None, deterministic: bool = False):
     log = env.get_log()
     n_steps = len(log["times"])
 
-    # Compute cumulative PnL
-    cum_pnl = np.cumsum(log["pnls"]).tolist()
+    cum_pnl = log.get("cumulative_pnls", np.cumsum(log["pnls"]).tolist())
 
     # Build sim_results.json
     sim_results = {
@@ -179,7 +179,9 @@ def main(experiment_dir: str, seed: int = None, deterministic: bool = False):
         "positions": log["positions"],
         "cum_pnl": [round(p, 4) for p in cum_pnl],
         "fills_buy_t": log["fills_buy_t"],
+        "fills_buy_type": log.get("fills_buy_type", []),
         "fills_sell_t": log["fills_sell_t"],
+        "fills_sell_type": log.get("fills_sell_type", []),
     }
 
     # Save

@@ -3,23 +3,22 @@ market_env.py
 
 Gymnasium environment for a single-stock market-making agent.
 
-The agent places a bid and an offer at each timestep. If the price moves
-through the bid, the agent buys; if through the offer, the agent sells.
+The agent quotes a bid and offer each step, parameterized as (width, skew)
+in multiples of half_spread. Fills happen via two mechanisms:
+  - Aggressive: agent's current quote crosses the current market → fill at market price
+  - Passive: agent's previous resting quote crossed by current market → fill at agent's price
 
-Observation space:
-    [predicted_return, current_position, realised_vol, inventory_age, mid_price_normed]
+See MARKET_ENV.md for full fill mechanics and RL_DESIGN.md for reward/obs design.
 
-Action space (continuous, 2D):
-    [bid_offset, ask_offset]   both in units of recent volatility
-    Offsets are always positive (distance from mid).  The network outputs
-    raw values in [-1, 1] which we rescale to [min_offset, max_offset].
+Observation space (4D):
+    [predicted_move, position_risk, time_remaining, cumulative_pnl]
+
+Action space (2D continuous):
+    [width, skew] in [-1, 1], rescaled to [0, max_width] and [-max_skew, max_skew]
 
 Reward:
-    r_t = mark_to_market_pnl
-          - lambda_inventory * position^2
-          - kappa_spread * (bid_offset + ask_offset)
-
-This gives a clean signal: earn the spread, but don't accumulate inventory.
+    r_t = mark_to_market_pnl - (n * position / (R² * sqrt(max(T-t, tau))))²
+    terminal: -lambda2 * |position| * half_spread
 """
 
 import gymnasium as gym
@@ -36,12 +35,14 @@ class MarketMakingEnv(gym.Env):
         self,
         returns: np.ndarray,          # (T,) single-stock return series
         predictions: np.ndarray,      # (T,) predicted returns from transformer
-        lambda_inventory: float = 0.01,
-        kappa_spread: float = 0.0005,
-        max_position: int = 10,       # hard position limit
-        min_offset: float = 0.2,      # min offset in vol units
-        max_offset: float = 3.0,      # max offset in vol units
-        vol_lookback: int = 20,       # window for realised vol
+        half_spread: float = 0.001,   # fixed market half-spread
+        target_vol: float = 0.02,     # known DGP daily vol (normalization constant)
+        r_squared: float = 0.01,      # transformer R² (measured, not tuned)
+        n_sigma: float = 1.0,         # risk tolerance in sigmas (tuning knob)
+        tau: int = 20,                # penalty floor in steps (prevents blow-up near EOD)
+        lambda2: float = 1.5,         # EOD liquidation impact multiplier (>= 1)
+        max_width: float = 3.0,       # max quote width in half_spread multiples
+        max_skew: float = 3.0,        # max quote skew in half_spread multiples
         initial_price: float = 100.0,
     ):
         super().__init__()
@@ -52,21 +53,26 @@ class MarketMakingEnv(gym.Env):
         self.predictions = predictions.astype(np.float64)
         self.T = len(returns)
 
-        # Params
-        self.lambda_inv = lambda_inventory
-        self.kappa_spread = kappa_spread
-        self.max_position = max_position
-        self.min_offset = min_offset
-        self.max_offset = max_offset
-        self.vol_lookback = vol_lookback
+        # Market microstructure
+        self.half_spread = half_spread
+        self.target_vol = target_vol
+
+        # Reward parameters
+        self.r_squared = max(r_squared, 1e-8)  # floor to avoid division by zero
+        self.n_sigma = n_sigma
+        self.tau = tau
+        self.lambda2 = lambda2
+
+        # Action scaling
+        self.max_width = max_width
+        self.max_skew = max_skew
         self.initial_price = initial_price
 
         # Spaces
-        # Observation: [prediction, position_normed, vol, inventory_age_normed, price_return]
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(5,), dtype=np.float64
+            low=-np.inf, high=np.inf, shape=(4,), dtype=np.float64
         )
-        # Action: [bid_offset_raw, ask_offset_raw] in [-1, 1], rescaled internally
+        # Action: [width_raw, skew_raw] in [-1, 1], rescaled internally
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(2,), dtype=np.float64
         )
@@ -75,124 +81,148 @@ class MarketMakingEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self.t = self.vol_lookback  # start after enough history for vol
+        self.t = 0
         self.position = 0
-        self.cash = 0.0
-        self.price = self.initial_price
-        self.inventory_age = 0  # how many steps since last flat
+        self.cumulative_pnl = 0.0
 
-        # Reconstruct price series from returns for this episode
+        # Reconstruct price series from returns, scaled by initial price
         self.prices = np.zeros(self.T + 1)
         self.prices[0] = self.initial_price
         for i in range(self.T):
             self.prices[i + 1] = self.prices[i] * (1.0 + self.returns[i])
+        # Scaled prices (start at 1.0)
+        self.scaled_prices = self.prices / self.initial_price
 
-        self.price = self.prices[self.t]
+        # Previous step's quotes (for passive fill checks). None on first step.
+        self.prev_bid = None
+        self.prev_offer = None
 
         # Trading log for visualization
         self.log = {
             "times": [], "mid_prices": [], "bids": [], "asks": [],
-            "positions": [], "pnls": [], "rewards": [],
-            "fills_buy_t": [], "fills_buy_p": [],
-            "fills_sell_t": [], "fills_sell_p": [],
+            "positions": [], "pnls": [], "rewards": [], "cumulative_pnls": [],
+            "fills_buy_t": [], "fills_buy_p": [], "fills_buy_type": [],
+            "fills_sell_t": [], "fills_sell_p": [], "fills_sell_type": [],
         }
 
         return self._get_obs(), {}
 
     def _get_obs(self):
+        price = self.scaled_prices[self.t]
         pred = self.predictions[self.t] if self.t < self.T else 0.0
-        pos_normed = self.position / self.max_position
-        vol = np.std(self.returns[max(0, self.t - self.vol_lookback):self.t]) + 1e-8
-        inv_age_normed = min(self.inventory_age / 50.0, 1.0)
-        price_ret = self.returns[self.t - 1] if self.t > 0 else 0.0
-        return np.array([pred, pos_normed, vol, inv_age_normed, price_ret], dtype=np.float64)
+        predicted_move = pred * price                            # dollars (scaled)
+        position_risk = self.position * self.target_vol * price  # dollars (scaled)
+        time_remaining = (self.T - self.t) / self.T              # [0, 1]
+        return np.array([predicted_move, position_risk, time_remaining,
+                         self.cumulative_pnl], dtype=np.float64)
 
-    def _rescale_offset(self, raw, vol):
-        """Map [-1, 1] -> [min_offset, max_offset] in vol units, then to price."""
-        frac = (raw + 1.0) / 2.0  # [0, 1]
-        offset_vol_units = self.min_offset + frac * (self.max_offset - self.min_offset)
-        return offset_vol_units * vol * self.price
+    def _rescale_action(self, action):
+        """Map [-1, 1] -> width in [0, max_width], skew in [-max_skew, max_skew]."""
+        width = (action[0] + 1.0) / 2.0 * self.max_width       # [0, max_width]
+        skew = action[1] * self.max_skew                         # [-max_skew, max_skew]
+        return width, skew
+
+    def _compute_quotes(self, mid, width, skew):
+        """Compute bid and offer from mid, width, skew (all in half_spread units)."""
+        bid = mid - width * self.half_spread + skew * self.half_spread
+        offer = mid + width * self.half_spread + skew * self.half_spread
+        return bid, offer
+
+    def _inventory_penalty(self):
+        """Time-varying quadratic inventory penalty: (n * p / (R² * sqrt(max(T-t, tau))))²"""
+        time_left = max(self.T - self.t, self.tau)
+        l_t = 1.0 / (self.r_squared * np.sqrt(time_left))
+        return (self.n_sigma * l_t * self.position) ** 2
 
     def step(self, action):
         if self.t >= self.T - 1:
             return self._get_obs(), 0.0, True, False, {}
 
-        vol = np.std(self.returns[max(0, self.t - self.vol_lookback):self.t]) + 1e-8
-        mid = self.prices[self.t]
+        mid = self.scaled_prices[self.t]
+        next_mid = self.scaled_prices[self.t + 1]
+        delta_mid = next_mid - mid
 
-        # Compute bid and ask prices
-        bid_offset = self._rescale_offset(action[0], vol)
-        ask_offset = self._rescale_offset(action[1], vol)
-        bid_price = mid - bid_offset
-        ask_price = mid + ask_offset
+        # Market quotes
+        bm = mid - self.half_spread
+        om = mid + self.half_spread
+        next_bm = next_mid - self.half_spread
+        next_om = next_mid + self.half_spread
 
-        # Next price
-        next_price = self.prices[self.t + 1]
-        price_move = next_price - mid
+        # Agent quotes
+        width, skew = self._rescale_action(action)
+        bid, offer = self._compute_quotes(mid, width, skew)
 
-        # Determine fills: if next price goes through our level, we get filled
-        bought = False
-        sold = False
+        # Save pre-fill position
+        position_before = self.position
+        pnl_step = 0.0
 
-        if next_price <= bid_price and self.position < self.max_position:
-            # Our bid gets hit — we buy
+        # --- Aggressive fills: current quote vs current market ---
+        if bid >= om:
+            # Agent's bid crosses market offer → aggressive buy at om
             self.position += 1
-            self.cash -= bid_price
-            bought = True
+            pnl_step += (next_mid - om)  # immediate mark-to-market
             self.log["fills_buy_t"].append(self.t)
-            self.log["fills_buy_p"].append(bid_price)
+            self.log["fills_buy_p"].append(om * self.initial_price)
+            self.log["fills_buy_type"].append("aggressive")
 
-        if next_price >= ask_price and self.position > -self.max_position:
-            # Our offer gets lifted — we sell
+        if offer <= bm:
+            # Agent's offer crosses market bid → aggressive sell at bm
             self.position -= 1
-            self.cash += ask_price
-            sold = True
+            pnl_step += (bm - next_mid)  # immediate mark-to-market
             self.log["fills_sell_t"].append(self.t)
-            self.log["fills_sell_p"].append(ask_price)
+            self.log["fills_sell_p"].append(bm * self.initial_price)
+            self.log["fills_sell_type"].append("aggressive")
 
-        # Mark-to-market PnL change
-        mtm_before = self.position * mid + self.cash  # before fill adjustments already done
-        # After fills, recalculate with new position and cash at next price
-        mtm_after = self.position * next_price + self.cash
-        pnl_step = mtm_after - (self.position * mid + self.cash) + \
-                   (self.cash - (self.cash))  # simplify
-        # Actually let's just track total PnL properly
-        pnl_step = self.position * price_move  # unrealised P&L on existing position
-        if bought:
-            pnl_step += (next_price - bid_price)  # immediate mark on the fill
-        if sold:
-            pnl_step += (ask_price - next_price)  # immediate mark on the fill
+        # --- Passive fills: previous quote vs current market ---
+        if self.prev_bid is not None:
+            if next_om <= self.prev_bid:
+                # Market offer moved through our resting bid → passive buy at prev_bid
+                self.position += 1
+                pnl_step += (next_mid - self.prev_bid)  # mark from fill price to current mid
+                self.log["fills_buy_t"].append(self.t)
+                self.log["fills_buy_p"].append(self.prev_bid * self.initial_price)
+                self.log["fills_buy_type"].append("passive")
 
-        # Track inventory age
-        if self.position == 0:
-            self.inventory_age = 0
-        else:
-            self.inventory_age += 1
+            if next_bm >= self.prev_offer:
+                # Market bid moved through our resting offer → passive sell at prev_offer
+                self.position -= 1
+                pnl_step += (self.prev_offer - next_mid)  # mark from fill price to current mid
+                self.log["fills_sell_t"].append(self.t)
+                self.log["fills_sell_p"].append(self.prev_offer * self.initial_price)
+                self.log["fills_sell_type"].append("passive")
+
+        # Unrealized PnL on pre-fill position
+        pnl_step += position_before * delta_mid
+
+        # Update cumulative PnL
+        self.cumulative_pnl += pnl_step
 
         # Reward
-        reward = (
-            pnl_step
-            - self.lambda_inv * self.position ** 2
-            - self.kappa_spread * (bid_offset + ask_offset)
-        )
+        terminated = self.t >= self.T - 2  # next step would be T-1
+
+        reward = pnl_step - self._inventory_penalty()
+        if terminated:
+            # Terminal penalty: forced EOD liquidation cost
+            reward -= self.lambda2 * abs(self.position) * self.half_spread
 
         # Logging
         self.log["times"].append(self.t)
-        self.log["mid_prices"].append(mid)
-        self.log["bids"].append(bid_price)
-        self.log["asks"].append(ask_price)
+        self.log["mid_prices"].append(mid * self.initial_price)
+        self.log["bids"].append(bid * self.initial_price)
+        self.log["asks"].append(offer * self.initial_price)
         self.log["positions"].append(self.position)
         self.log["pnls"].append(pnl_step)
         self.log["rewards"].append(reward)
+        self.log["cumulative_pnls"].append(self.cumulative_pnl)
+
+        # Save current quotes for next step's passive fill check
+        self.prev_bid = bid
+        self.prev_offer = offer
 
         # Advance
         self.t += 1
-        self.price = next_price
 
-        terminated = self.t >= self.T - 1
-        truncated = False
-
-        return self._get_obs(), reward, terminated, truncated, {}
+        return self._get_obs(), reward, terminated, False, {}
 
     def get_log(self):
         """Return the trading log as a dict of lists."""

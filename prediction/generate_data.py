@@ -140,7 +140,8 @@ def generate(
     noise = generate_idiosyncratic_noise(n_timesteps, n_stocks, rho, sigma=np.ones(n_stocks), rng=rng)
     signal = factors @ loadings.T
 
-    # Per-step vol targets: daily vol scaled down by sqrt(steps_per_day)
+    # Step 1: set per-step SNR ratio using i.i.d. approximation.
+    # This correctly partitions variance between signal and noise.
     per_step_vol = target_vol / np.sqrt(steps_per_day)
     sigma_signal_target = per_step_vol * np.sqrt(snr / (1.0 + snr))
     sigma_noise_target  = per_step_vol / np.sqrt(1.0 + snr)
@@ -153,6 +154,18 @@ def generate(
     noise   = noise   * noise_scale
 
     returns = signal + noise
+
+    # Step 2: correct for autocorrelation. The AR factor and noise structure
+    # inflate the daily vol (std of sum over one day) well beyond the i.i.d.
+    # assumption. Rescale everything uniformly so the empirical daily vol
+    # matches target_vol. Using sum as a fast approximation of cumprod-1
+    # (valid since per-step returns are O(1e-4)).
+    actual_daily_std = np.std(np.sum(returns, axis=0))
+    daily_correction = target_vol / actual_daily_std
+    returns *= daily_correction
+    signal  *= daily_correction
+    factors *= daily_correction
+    noise   *= daily_correction
 
     empirical_snr = compute_snr(loadings, factors, noise)
 

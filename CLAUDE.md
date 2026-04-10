@@ -51,7 +51,7 @@ Individual scripts can still be run standalone — see their `--help` for args.
   },
   "rl": {
     "predictor": "transformer",
-    "lambda_inv": 0.01, "kappa_spread": 0.0005,
+    "half_spread": 0.001, "n_sigma": 1.0, "lambda2": 1.5,
     "n_iterations": 200
   }
 }
@@ -74,7 +74,7 @@ See `DATA_MODEL.md` for the full model spec, parameter interpretation, and calib
 
 **Pipeline: train_rl.py (loads frozen transformer + data → trains PPO agent)**
 
-- **`market_env.py`** — Gymnasium env (`MarketMakingEnv`) + `VectorizedMarketEnv`. Agent places bid/ask offsets (2D continuous action in vol units). Fills occur when next price crosses the level. Reward = realized PnL − λ·position² − κ·spread. 5D observation: predicted return, normalized position, realized vol, inventory age, last return.
+- **`market_env.py`** — Gymnasium env (`MarketMakingEnv`) + `VectorizedMarketEnv`. Agent quotes (width, skew) in half_spread multiples. Two fill types: aggressive (crosses market, pays spread) and passive (resting quote crossed by market, earns spread). 4D observation: predicted move, position risk, time remaining, cumulative PnL. See `MARKET_ENV.md` for fill mechanics, `RL_DESIGN.md` for reward/obs/action design.
 - **`policy.py`** — `ActorCritic` shared-trunk MLP (~10k params) with PPO update logic and GAE-Lambda advantage estimation via `RolloutBuffer`.
 - **`train_rl.py`** — Loads data, generates transformer predictions (or falls back to momentum), runs PPO over vectorized envs. Samples across RL train stocks for env creation.
 - **`generate_demo_data.py`** — Creates fake `sim_results.json` for testing the visualizer without training.
@@ -92,8 +92,8 @@ The transformer is **frozen** during RL training — its predictions are just in
 - **Normalization** — scalar mean/std computed from transformer train stocks only; saved in checkpoint dir, reloaded at inference
 - **MPS device** — `num_workers=0` in DataLoaders (MPS + multiprocessing breaks on macOS)
 - **R² vs naive** — baseline is predicting zero. R² near 0 is expected; R² < 0 is a bug signal
-- **Reward function** — Avellaneda-Stoikov inspired: quadratic inventory penalty is critical, without it the agent takes directional bets instead of market-making
-- **RL tuning levers** — `lambda_inv` (inventory penalty), `kappa_spread` (spread cost), `max_position` (hard limit ±10)
+- **Reward function** — Time-varying quadratic inventory penalty calibrated from R² and remaining time. Terminal EOD liquidation cost. See `RL_DESIGN.md` for derivation.
+- **RL tuning levers** — `n_sigma` (risk tolerance), `half_spread` (market spread), `lambda2` (EOD impact), `R²` (measured from transformer)
 
 ## Output Directories
 
