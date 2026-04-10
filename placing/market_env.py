@@ -203,7 +203,9 @@ class MarketMakingEnv(gym.Env):
         reward = pnl_step - self._inventory_penalty()
         if terminated:
             # Terminal penalty: forced EOD liquidation cost
-            reward -= self.lambda2 * abs(self.position) * self.half_spread
+            eod_cost = self.lambda2 * abs(self.position) * self.half_spread
+            reward -= eod_cost
+            self.cumulative_pnl -= eod_cost
 
         # Logging
         self.log["times"].append(self.t)

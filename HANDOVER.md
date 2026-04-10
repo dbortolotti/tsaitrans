@@ -1,267 +1,82 @@
-# Handover: Market Env Redesign (active topic)
+# Handover
 
-> **Session handover** — pick up from "Market Env Redesign" section below before reading the rest.
-
----
-
-## Active Topic: Market Env Redesign
-
-### What has been decided (this session)
-
-The fill mechanics are fully designed and documented in `MARKET_ENV.md`. Key decisions:
-
-**Entities:**
-- DGP generates mid prices. Market has fixed `half_spread` parameter.
-- bm(t) = mid(t) − half_spread, om(t) = mid(t) + half_spread
-- Agent posts bid b(t) and offer o(t) each step
-
-**Two fill types, checked independently each step:**
-
-1. **Aggressive fill** — agent's current quote crosses current market. Filled at market price (taker, pays spread).
-   - b(t) >= om(t) → buy at om(t)
-   - o(t) <= bm(t) → sell at bm(t)
-
-2. **Passive fill** — agent's previous resting quote crossed by current market. Filled at agent's quoted price (maker, earns spread).
-   - om(t) <= b(t-1) → buy at b(t-1)
-   - bm(t) >= o(t-1) → sell at o(t-1)
-
-**Fill multiplicity:** All four conditions checked independently. Any/all that fire execute. Same-side double fills (e.g. aggressive buy + passive buy) both happen. Position constraints (none currently) are enforced pre-trade — order not submitted, so fill condition never checked.
-
-**Reward function** (fully designed, see `RL_DESIGN.md`):
-- Per-step: `reward(t) = mark_to_market_pnl(t) − (n · l(t) · position)²`
-- `l(t) = 1 / (R² · sqrt(max(T - t, τ)))` — time-varying, tightens as day progresses
-- Terminal: `λ2 · |position| · half_spread` — EOD forced liquidation cost
-- Parameters: `R²` (measured), `n` (risk tolerance, single tuning knob), `τ` (floor, ~10-50), `λ2` (>=1)
-
-**Observation space** (4D, see `RL_DESIGN.md`):
-1. Predicted move: `prediction * price` (dollars)
-2. Position risk: `position * target_vol * price` (dollars)
-3. Time remaining: `(T - t) / T`
-4. Cumulative PnL (dollars)
-
-All prices scaled by initial price (start at 1.0). No rolling vol, no last return, no inventory age — all redundant given these 4 features. `target_vol` replaces `return_scale` (which was a look-ahead bug).
-
-**Action space** (2D, see `RL_DESIGN.md`):
-- Width `w ∈ [0, max_width]` — symmetric quote distance in `half_spread` multiples. Width >= 0 prevents double-side aggression.
-- Skew `s ∈ [-max_skew, max_skew]` — directional shift in `half_spread` multiples.
-- `b(t) = mid(t) - w·half_spread + s·half_spread`
-- `o(t) = mid(t) + w·half_spread + s·half_spread`
-
-### Next step
-**Implement** — refactor `placing/market_env.py`, `placing/train_rl.py`, `placing/policy.py`, `simulate.py` to match the new design. All design details in `RL_DESIGN.md` and `MARKET_ENV.md`.
+> **Session handover** — read the Active Topic first, then reference docs as needed.
 
 ---
 
-# Handover: Transformer + RL Market Making Experiment
+## Active Topic: Grid Search
 
-## What This Is
+### Context
 
-A learning experiment (not production) with two modules:
+Market env redesign is **implemented and pushed** (2 commits on main). All design docs are up to date:
+- `MARKET_ENV.md` — fill mechanics (aggressive + passive)
+- `RL_DESIGN.md` — reward function, observation space, action space, λ calibration
 
-1. **Prediction** — Univariate encoder-only transformer for synthetic time series forecasting. Explores how model complexity and noise level (SNR) affect prediction quality.
-2. **Placing** — RL market-making agent (PPO) that uses transformer predictions as features to learn bid/ask placement.
+### What was just done
 
-The transformer and RL agent are trained separately. The transformer is frozen during RL training — its predictions are just input features to the policy.
+- Implemented new `market_env.py` with aggressive/passive fills, 4D obs, width/skew actions, time-varying penalty
+- Updated `policy.py`, `train_rl.py`, `simulate.py`, `run_experiment.py`, experiment configs
+- Fixed context_len mismatch bug in `train_rl.py` (was hardcoded, now reads from checkpoint)
+- Added auto-loading of R² from transformer metrics when not set in config
+- Set `half_spread` default to 5bps (0.0005)
+- Smoke-tested full pipeline with `experiments/smoke.json`
+- Created `grid_search.py` — grid search over `n_sigma` and `lambda2` using existing experiment data + transformer
 
-Runs on M3/M4 Mac Mini via MPS. PyTorch only — no HuggingFace, no Lightning.
+### Grid search script (`grid_search.py`)
 
----
+Reuses an existing experiment's data and trained transformer. Creates `output/<experiment>_grid/ns{n_sigma}_l2{lambda2}/` for each combination. Symlinks data/checkpoints, runs RL + simulation only.
 
-## How To Run
+Grid values:
+- `n_sigma`: 0.5, 1.0, 2.0, 3.0
+- `lambda2`: 1.0, 3.0, 5.0
 
-Everything is driven by a single experiment JSON config:
+**Status: script written, not yet tested on experiment2.** The user interrupted before the test run. Next step is to run it:
 
 ```bash
-pip install torch numpy matplotlib gymnasium
+python grid_search.py output/experiment2 2>&1 | tee log.txt
+```
 
-# Run the full pipeline (generate data → train transformer → inference → train RL)
+`output/experiment2` exists with trained transformer (R²=0.558, SNR=1.0, 95 stocks, 2000 steps).
+
+### Known issue
+
+`simulate.py` generates a fresh stock for visualization. With `n_stocks=1` and certain DGP params, `generate_data.py` can produce NaN (divide-by-zero in vol scaling). This is a pre-existing bug in single-stock generation, not related to the env redesign. Only affects simulation, not training.
+
+---
+
+## Design Docs
+
+| Doc | Contents |
+|---|---|
+| `MARKET_ENV.md` | Fill mechanics: aggressive/passive fills, examples, multiplicity rules |
+| `RL_DESIGN.md` | Observation space (4D), reward function (time-varying penalty + terminal), action space (width/skew), λ calibration from R² |
+| `FUTURE_DEVELOPMENTS.md` | Multi-step predictions, Kelly criterion penalty |
+| `DATA_MODEL.md` | DGP specification, parameter interpretation |
+
+---
+
+## Key Parameters
+
+| Parameter | Value | Source |
+|---|---|---|
+| `half_spread` | 0.0005 (5bps) | Fixed, not searched |
+| `R²` | Auto-loaded from transformer metrics | Measured |
+| `target_vol` | From data config (typically 0.02) | Known DGP param |
+| `n_sigma` | Grid searched: 0.5, 1, 2, 3 | Risk tolerance tuning knob |
+| `lambda2` | Grid searched: 1, 3, 5 | EOD liquidation impact |
+| `tau` | 20 | Penalty floor, not sensitive |
+
+---
+
+## Quick Reference
+
+```bash
+# Full pipeline
 python run_experiment.py experiments/example.json
 
-# All outputs go to output/<experiment_name>/
+# Grid search (RL only, reuses existing data + transformer)
+python grid_search.py output/experiment2 2>&1 | tee log.txt
+
+# Smoke test (fast, tiny config)
+python run_experiment.py experiments/smoke.json
 ```
-
-The JSON only needs to specify parameters you want to vary — everything else uses defaults from `run_experiment.py:DEFAULTS`.
-
-### Example config (`experiments/example.json`)
-
-```json
-{
-  "data": {
-    "sigma_eps": 0.5,
-    "stocks_transformer_train": 3,
-    "stocks_transformer_val": 2,
-    "stocks_rl_train": 2,
-    "stocks_rl_val": 2,
-    "stocks_test": 1
-  },
-  "transformer": { "d_model": 64, "n_layers": 3, "n_epochs": 50 },
-  "rl": { "lambda_inv": 0.01, "kappa_spread": 0.0005, "n_iterations": 200 }
-}
-```
-
-Individual scripts can still be run standalone — see their `--help` for args.
-
----
-
-## Architecture
-
-```
-┌────────────────────┐     ┌──────────────┐     ┌─────────────┐
-│ generate_data.py   │────▶│  train.py     │────▶│ Transformer │
-│ (factor model)     │     │  (prediction) │     │ (frozen)    │
-└────────────────────┘     └──────────────┘     └──────┬──────┘
-                                                       │ predictions
-                                                       ▼
-┌────────────────────┐     ┌──────────────┐     ┌─────────────┐
-│ market_env.py      │◀───│ train_rl.py   │────▶│ policy.py   │
-│ (gym environment)  │     │ (PPO loop)    │     │ (actor-     │
-└────────────────────┘     └──────────────┘     │  critic MLP)│
-                                                └─────────────┘
-```
-
-### Prediction (`prediction/`)
-
-| File | Purpose |
-|---|---|
-| `generate_data.py` | Latent factor model: observations = loadings × VAR(1) factors + AR(1) noise |
-| `model.py` | `TimeSeriesDataset` (per-stock sliding windows), `FactorTransformer` (univariate, n_stocks=1) |
-| `train.py` | AdamW + cosine LR with warmup + early stopping + grad clipping |
-| `inference.py` | Loads checkpoint, runs on test stocks, computes metrics, saves plots |
-
-### Placing (`placing/`)
-
-| File | Purpose |
-|---|---|
-| `market_env.py` | Gymnasium env: order placement, fills, inventory tracking |
-| `policy.py` | ActorCritic MLP (~5k params), PPO rollout buffer, update logic |
-| `train_rl.py` | Loads data + transformer, runs PPO over vectorized envs |
-| `generate_demo_data.py` | Creates fake `sim_results.json` for testing the visualizer |
-| `trading_visualizer.jsx` | Interactive React component for price/bid/ask/position/PnL visualization |
-
----
-
-## Data Generation Model
-
-$$x_{i,t} = \mathbf{\lambda}_i^\top \mathbf{f}_t + \epsilon_{i,t}$$
-
-- **Factors:** $\mathbf{f}_t = \mathbf{A} \mathbf{f}_{t-1} + \boldsymbol{\eta}_t$ (VAR(1), spectral radius controls persistence)
-- **Noise:** $\epsilon_{i,t} = \rho_i \epsilon_{i,t-1} + \sigma_i \xi_{i,t}$ (AR(1) per stock)
-- **SNR:** $\text{SNR}_i = \text{Var}(\mathbf{\lambda}_i^\top \mathbf{f}_t) / \text{Var}(\epsilon_{i,t})$
-
-Control SNR via `sigma_eps` (lower = higher SNR). `sigma_f=1.0` is the signal scale.
-
----
-
-## Key Design Decisions
-
-- **Stocks as realizations** — each stock is an i.i.d. sample from the same DGP. Splits are across stocks, not time. The 5 stock groups (transformer train/val, RL train/val, test) are disjoint.
-- **RL trains on transformer-OOS stocks** — the RL agent sees predictions on stocks the transformer never trained on, so it learns from realistic (not overfit) prediction quality.
-- **Univariate model** — the transformer processes one stock at a time (n_stocks=1). All stocks in a split are pooled into one training dataset.
-- **Normalized RL inputs** — returns and predictions are standardized (using transformer's normalization stats) before feeding to the market env, preventing price explosion from large raw returns.
-- **Returns not prices** — avoids non-stationarity.
-- **Factor loadings not used as features** — the transformer must infer structure from returns alone. Loadings saved in `ground_truth_*.npz` for analysis only.
-- **Normalization** — scalar mean/std from transformer train stocks. Saved in checkpoint dir, reloaded at inference.
-- **MPS device** — `num_workers=0` in DataLoaders (MPS + multiprocessing = trouble on macOS).
-
----
-
-## Stock Split
-
-Controlled by 5 parameters in the experiment config:
-
-| Stocks | Group | Purpose |
-|---|---|---|
-| 0–2 | `stocks_transformer_train` | Train the transformer |
-| 3–4 | `stocks_transformer_val` | Validate / early-stop the transformer |
-| 5–6 | `stocks_rl_train` | Train the RL agent (transformer OOS) |
-| 7–8 | `stocks_rl_val` | Validate the RL agent |
-| 9 | `stocks_test` | Final evaluation (both models) |
-
-Total `n_stocks` is the sum of all 5 group sizes.
-
----
-
-## Reward Function
-
-```
-reward = realized_pnl - λ * position² - κ * spread_cost
-```
-
-| Term | Default | Tuning |
-|---|---|---|
-| `λ (lambda_inv)` | 0.01 | Increase if agent holds too long; decrease if it barely trades |
-| `κ (kappa_spread)` | 0.0005 | Increase to force tighter quotes; decrease if agent never gets filled |
-
-Based on Avellaneda-Stoikov. The quadratic inventory penalty is critical — without it the agent takes directional bets instead of market-making.
-
----
-
-## Environment Details
-
-**Observation (5D):** predicted return, position (normalized), realized vol, inventory age (normalized), last return.
-
-**Action (2D continuous):** bid/ask offsets in [-1, 1], rescaled to [min_offset, max_offset] in vol units.
-
-**Fill logic:** if next_price ≤ bid → buy; if next_price ≥ ask → sell. Hard position limit ±10.
-
----
-
-## Output Structure
-
-```
-output/<experiment_name>/
-    <name>.json              # copy of experiment config
-    resolved_config.json     # config with all defaults filled in
-    data/
-        returns_<name>.npy   # (T, n_stocks) returns
-        ground_truth_<name>.npz
-        metadata_<name>.json
-    checkpoints/
-        best_model.pt        # best val loss transformer
-        config.json
-        mean.npy, std.npy    # normalization stats (scalars)
-        train_log.csv
-    results/
-        metrics.json         # MSE, R², directional accuracy
-        predictions.png
-    checkpoints_rl/
-        best_policy.pt
-        final_policy.pt
-        config.json
-        train_log.json
-```
-
----
-
-## Metrics to Watch
-
-- **R² vs naive** — baseline is predicting zero. R² near 0 is normal for noisy returns. R² < 0 is a bug signal.
-- **Directional accuracy** — did the model get the sign right?
-- **RL mean reward** — should start negative and improve. Entropy should decline as policy converges.
-
----
-
-## What To Experiment With
-
-- **Vary `sigma_eps`** — higher noise = harder prediction = agent relies more on spread capture than alpha.
-- **Compare transformer vs momentum** — set `"predictor": "momentum"` in the RL config.
-- **Vary `lambda_inv`** — watch how position behavior changes.
-- **Model size** — vary `d_model`, `n_layers` to see complexity vs. prediction quality tradeoff.
-- **Stock split sizes** — more transformer train stocks = better predictions but fewer RL train stocks.
-
----
-
-## Known Limitations
-
-1. **No adverse selection.** Real market makers get picked off by informed traders.
-2. **Single stock per env.** A real market maker would manage a portfolio.
-3. **No latency / queue priority.** Fills are instantaneous and guaranteed if price crosses.
-4. **Reward scale sensitivity.** Changing `sigma_eps` significantly may require re-tuning `lambda_inv` and `kappa_spread`.
-
----
-
-## User Preferences
-
-- Direct tone — challenge assumptions, flag uncertainty, no filler
-- PyTorch only — no HuggingFace, no Lightning
-- Code readable and commented for learning, not production-clever

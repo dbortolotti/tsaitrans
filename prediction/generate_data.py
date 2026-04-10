@@ -160,7 +160,19 @@ def generate(
     # assumption. Rescale everything uniformly so the empirical daily vol
     # matches target_vol. Using sum as a fast approximation of cumprod-1
     # (valid since per-step returns are O(1e-4)).
-    actual_daily_std = np.std(np.sum(returns, axis=0))
+    n_days = n_timesteps // steps_per_day
+    if n_days > 1:
+        # Multiple days: compute daily sums and take std across all (days × stocks)
+        usable = n_days * steps_per_day
+        daily_sums = returns[:usable].reshape(n_days, steps_per_day, n_stocks).sum(axis=1)
+        actual_daily_std = np.std(daily_sums)
+    elif n_stocks > 1:
+        # Single day, multiple stocks: std across stocks
+        actual_daily_std = np.std(np.sum(returns, axis=0))
+    else:
+        # Single day, single stock: can't estimate empirically, skip correction
+        actual_daily_std = target_vol
+
     daily_correction = target_vol / actual_daily_std
     returns *= daily_correction
     signal  *= daily_correction

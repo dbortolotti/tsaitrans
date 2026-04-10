@@ -122,11 +122,23 @@ def main(experiment_dir: str, seed: int = None, deterministic: bool = False):
     policy = ActorCritic(obs_dim=4, act_dim=2, hidden=64).to(device)
 
     policy_path = os.path.join(rl_dir, "best_policy.pt")
+    norm_path = os.path.join(rl_dir, "best_normalizer.npz")
     if not os.path.exists(policy_path):
         policy_path = os.path.join(rl_dir, "final_policy.pt")
+        norm_path = os.path.join(rl_dir, "final_normalizer.npz")
     policy.load_state_dict(torch.load(policy_path, map_location=device, weights_only=True))
     policy.eval()
     print(f"[INFO] Loaded policy from {policy_path}")
+
+    # Load observation normalizer (if available — older checkpoints won't have it)
+    obs_mean = np.zeros(4, dtype=np.float64)
+    obs_var = np.ones(4, dtype=np.float64)
+    if os.path.exists(norm_path):
+        norm_data = np.load(norm_path)
+        obs_mean = norm_data["obs_mean"]
+        obs_var = norm_data["obs_var"]
+        print(f"[INFO] Loaded obs normalizer from {norm_path}")
+    obs_std = np.sqrt(obs_var + 1e-8)
 
     # --- Run simulation using MarketMakingEnv ---
     from market_env import MarketMakingEnv
@@ -148,7 +160,8 @@ def main(experiment_dir: str, seed: int = None, deterministic: bool = False):
     total_reward = 0.0
 
     while True:
-        obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+        obs_norm = (obs - obs_mean) / obs_std
+        obs_t = torch.tensor(obs_norm, dtype=torch.float32, device=device).unsqueeze(0)
         actions, _, _ = policy.get_action(obs_t, deterministic=deterministic)
         obs, reward, terminated, truncated, _ = env.step(actions[0])
         total_reward += reward
@@ -184,10 +197,9 @@ def main(experiment_dir: str, seed: int = None, deterministic: bool = False):
         "fills_sell_type": log.get("fills_sell_type", []),
     }
 
-    # Save
-    results_dir = os.path.join(experiment_dir, "results")
-    os.makedirs(results_dir, exist_ok=True)
-    out_path = os.path.join(results_dir, "sim_results.json")
+    # Save alongside the RL checkpoint (results/ may be a shared symlink in grid runs)
+    os.makedirs(rl_dir, exist_ok=True)
+    out_path = os.path.join(rl_dir, f"sim_results_{seed}.json")
     with open(out_path, "w") as f:
         json.dump(sim_results, f)
 

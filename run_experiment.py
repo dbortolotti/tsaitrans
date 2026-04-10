@@ -64,7 +64,7 @@ DEFAULTS = {
         "lr": 3e-4,
         "gamma": 0.99,
         "gae_lambda": 0.95,
-        "half_spread": 0.001,
+        "half_spread": 0.0005,
         "target_vol": 0.02,
         "n_sigma": 1.0,
         "tau": 20,

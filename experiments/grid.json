@@ -1,0 +1,41 @@
+{
+  "data": {
+    "target_vol": 0.02,
+    "snr": 1.0,
+    "factor_half_life": 0.005,
+    "noise_half_life_range": [0.001, 0.003],
+    "n_factors": 3,
+    "steps_per_day": 2000,
+    "n_steps": 2000,
+    "stocks_transformer_train": 50,
+    "stocks_transformer_val": 10,
+    "stocks_rl_train": 20,
+    "stocks_rl_val": 5,
+    "stocks_test": 10
+  },
+  "transformer": {
+    "context_len": 40,
+    "d_model": 64,
+    "n_heads": 4,
+    "n_layers": 3,
+    "lr": 3e-4,
+    "n_epochs": 100,
+    "patience": 20
+  },
+  "rl": {
+    "predictor": "transformer",
+    "n_envs": 32,
+    "n_iterations": 200,
+    "rollout_steps": 512,
+    "lr": 3e-4,
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "half_spread": 0.0005,
+    "target_vol": 0.02,
+    "n_sigma": 1.0,
+    "tau": 20,
+    "lambda2": 1.5,
+    "max_width": 3.0,
+    "max_skew": 3.0
+  }
+}

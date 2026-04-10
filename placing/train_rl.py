@@ -25,7 +25,7 @@ import numpy as np
 import torch
 
 from market_env import MarketMakingEnv, VectorizedMarketEnv
-from policy import ActorCritic, RolloutBuffer, ppo_update
+from policy import ActorCritic, RolloutBuffer, RunningMeanStd, ppo_update
 
 
 def load_transformer_predictions(returns, stock_indices, checkpoint_dir):
@@ -201,27 +201,24 @@ def train(
     T = returns.shape[0]
     n_rl_stocks = len(rl_train_stocks)
 
-    # Episode length
-    seq_len = min(500, T // 2)
-
     def make_env_data(n):
-        """Create n random sub-sequences, sampling across RL train stocks."""
+        """Create n episodes, each a full trading day from a random RL train stock."""
         ret_list, pred_list = [], []
         rng = np.random.default_rng()
         for _ in range(n):
             si = rng.integers(0, n_rl_stocks)
             stock_idx = rl_train_stocks[si]
-            stock_returns = returns[:, stock_idx]
-            stock_preds = predictions[:, si]
-
-            start = rng.integers(0, T - seq_len)
-            ret_list.append(stock_returns[start : start + seq_len])
-            pred_list.append(stock_preds[start : start + seq_len])
+            ret_list.append(returns[:, stock_idx])
+            pred_list.append(predictions[:, si])
         return ret_list, pred_list
 
     # Policy
     policy = ActorCritic(obs_dim=4, act_dim=2, hidden=64).to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=lr, eps=1e-5)
+
+    # Reward and observation normalization for stable PPO training
+    reward_rms = RunningMeanStd(shape=())
+    obs_rms = RunningMeanStd(shape=(4,))
 
     n_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     print(f"[INFO] Policy parameters: {n_params:,}")
@@ -234,9 +231,10 @@ def train(
     log_rows = []
 
     print(
-        f"\n{'Iter':>5} {'MeanRew':>10} {'PolLoss':>10} {'VLoss':>10} {'Entropy':>10} {'Time':>8}"
+        f"\n{'Iter':>5} {'MeanRew':>10} {'PolLoss':>10} {'VLoss':>10} "
+        f"{'Entropy':>10} {'RewStd':>10} {'Time':>8}"
     )
-    print("-" * 60)
+    print("-" * 72)
 
     t_start = time.time()
 
@@ -259,19 +257,27 @@ def train(
 
         buffer = RolloutBuffer()
         obs = vec_env.reset()
+        obs_rms.update(obs)
         episode_rewards = []
 
         for step in range(rollout_steps):
-            obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
+            obs_norm = (obs - obs_rms.mean) / obs_rms.std
+            obs_t = torch.tensor(obs_norm, dtype=torch.float32, device=device)
             actions, log_probs, values = policy.get_action(obs_t)
 
             next_obs, rewards, dones = vec_env.step(actions)
-            buffer.add(obs, actions, log_probs, rewards, values, dones)
+
+            reward_rms.update(rewards)
+            obs_rms.update(next_obs)
+            rewards_norm = rewards / reward_rms.std
+
+            buffer.add(obs_norm, actions, log_probs, rewards_norm, values, dones)
             obs = next_obs
-            episode_rewards.append(rewards.mean())
+            episode_rewards.append(rewards.mean())  # log raw rewards
 
         with torch.no_grad():
-            obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
+            obs_norm = (obs - obs_rms.mean) / obs_rms.std
+            obs_t = torch.tensor(obs_norm, dtype=torch.float32, device=device)
             _, _, last_values = policy.forward(obs_t)
             last_values = last_values.cpu().numpy()
 
@@ -282,7 +288,8 @@ def train(
         elapsed = time.time() - iter_start
         print(
             f"{iteration:5d} {mean_reward:10.4f} {metrics['policy_loss']:10.4f} "
-            f"{metrics['value_loss']:10.4f} {metrics['entropy']:10.4f} {elapsed:7.1f}s"
+            f"{metrics['value_loss']:10.4f} {metrics['entropy']:10.4f} "
+            f"{float(reward_rms.std):10.2f} {elapsed:7.1f}s"
         )
 
         log_rows.append(
@@ -290,6 +297,9 @@ def train(
                 "iteration": iteration,
                 "mean_reward": float(mean_reward),
                 **metrics,
+                "reward_std": float(reward_rms.std),
+                "obs_mean": obs_rms.mean.tolist(),
+                "obs_std": obs_rms.std.tolist(),
                 "elapsed": elapsed,
             }
         )
@@ -297,12 +307,16 @@ def train(
         if mean_reward > best_reward:
             best_reward = mean_reward
             torch.save(policy.state_dict(), os.path.join(save_dir, "best_policy.pt"))
+            np.savez(os.path.join(save_dir, "best_normalizer.npz"),
+                     obs_mean=obs_rms.mean, obs_var=obs_rms.var, obs_count=obs_rms.count)
 
     total_time = time.time() - t_start
     print(f"\n[INFO] Training complete in {total_time:.1f}s")
     print(f"[INFO] Best mean reward: {best_reward:.4f}")
 
     torch.save(policy.state_dict(), os.path.join(save_dir, "final_policy.pt"))
+    np.savez(os.path.join(save_dir, "final_normalizer.npz"),
+             obs_mean=obs_rms.mean, obs_var=obs_rms.var, obs_count=obs_rms.count)
 
     with open(os.path.join(save_dir, "train_log.json"), "w") as f:
         json.dump(log_rows, f, indent=2)

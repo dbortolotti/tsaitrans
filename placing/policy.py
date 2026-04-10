@@ -77,6 +77,37 @@ class ActorCritic(nn.Module):
         return log_prob, entropy, value
 
 
+class RunningMeanStd:
+    """Welford's online algorithm for running mean/variance."""
+
+    def __init__(self, shape=()):
+        self.mean = np.zeros(shape, dtype=np.float64)
+        self.var = np.ones(shape, dtype=np.float64)
+        self.count = 1e-4
+
+    @property
+    def std(self):
+        return np.sqrt(self.var + 1e-8)
+
+    def update(self, batch):
+        batch = np.asarray(batch, dtype=np.float64)
+        batch_mean = batch.mean(axis=0)
+        batch_var = batch.var(axis=0)
+        batch_count = batch.shape[0]
+        self._update_from_moments(batch_mean, batch_var, batch_count)
+
+    def _update_from_moments(self, batch_mean, batch_var, batch_count):
+        delta = batch_mean - self.mean
+        total = self.count + batch_count
+        new_mean = self.mean + delta * batch_count / total
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        m2 = m_a + m_b + delta**2 * self.count * batch_count / total
+        self.mean = new_mean
+        self.var = m2 / total
+        self.count = total
+
+
 class RolloutBuffer:
     """Stores rollout data for PPO updates."""
 

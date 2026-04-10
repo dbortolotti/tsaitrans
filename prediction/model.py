@@ -208,7 +208,7 @@ class FactorTransformer(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers, enable_nested_tensor=False)
 
         # 4. Output head: use only the last timestep's representation
         self.output_head = nn.Linear(d_model, n_stocks * horizon)
