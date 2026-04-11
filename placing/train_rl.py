@@ -169,11 +169,13 @@ def train(
 
     # Extract config
     n_envs = config.get("n_envs", 32)
-    n_iterations = config.get("n_iterations", 200)
-    rollout_steps = config.get("rollout_steps", 512)
+    n_iterations = config.get("n_iterations", 500)
+    rollout_steps = config.get("rollout_steps", 2000)
     lr = config.get("lr", 3e-4)
     gamma = config.get("gamma", 0.99)
     lam = config.get("gae_lambda", 0.95)
+    ent_coef_start = config.get("ent_coef", 0.01)
+    ent_coef_end = config.get("ent_coef_end", 0.001)
 
     # New env parameters
     half_spread = config.get("half_spread", 0.001)
@@ -232,9 +234,9 @@ def train(
 
     print(
         f"\n{'Iter':>5} {'MeanRew':>10} {'PolLoss':>10} {'VLoss':>10} "
-        f"{'Entropy':>10} {'RewStd':>10} {'Time':>8}"
+        f"{'Entropy':>10} {'EntCoef':>10} {'RewStd':>10} {'Time':>8}"
     )
-    print("-" * 72)
+    print("-" * 82)
 
     t_start = time.time()
 
@@ -282,14 +284,17 @@ def train(
             last_values = last_values.cpu().numpy()
 
         buffer.compute_returns_and_advantages(last_values, gamma, lam)
-        metrics = ppo_update(policy, optimizer, buffer, device)
+        # Linear entropy coefficient anneal
+        frac = iteration / max(n_iterations - 1, 1)
+        ent_coef = ent_coef_start + (ent_coef_end - ent_coef_start) * frac
+        metrics = ppo_update(policy, optimizer, buffer, device, ent_coef=ent_coef)
 
         mean_reward = np.mean(episode_rewards)
         elapsed = time.time() - iter_start
         print(
             f"{iteration:5d} {mean_reward:10.4f} {metrics['policy_loss']:10.4f} "
             f"{metrics['value_loss']:10.4f} {metrics['entropy']:10.4f} "
-            f"{float(reward_rms.std):10.2f} {elapsed:7.1f}s"
+            f"{ent_coef:10.4f} {float(reward_rms.std):10.2f} {elapsed:7.1f}s"
         )
 
         log_rows.append(

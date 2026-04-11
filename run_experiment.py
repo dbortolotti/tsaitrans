@@ -59,8 +59,8 @@ DEFAULTS = {
     "rl": {
         "predictor": "transformer",
         "n_envs": 32,
-        "n_iterations": 200,
-        "rollout_steps": 512,
+        "n_iterations": 500,
+        "rollout_steps": 2000,
         "lr": 3e-4,
         "gamma": 0.99,
         "gae_lambda": 0.95,

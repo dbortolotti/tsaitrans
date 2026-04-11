@@ -20,8 +20,8 @@ import time
 
 
 # --- Grid ---
-N_SIGMA_VALUES = [0.5, 1.0, 2.0, 3.0]
-LAMBDA2_VALUES = [1.0, 3.0, 5.0]
+N_SIGMA_VALUES = [0, 0.05, 0.1, 0.2, 0.3, 1]
+LAMBDA2_VALUES = [1.0, 2.0, 3.0, 10, 100]
 
 N_SIMS = 10
 
@@ -29,7 +29,7 @@ N_SIMS = 10
 def main(base_experiment: str, output_name: str, config_path: str):
     # Load config from JSON file
     if not os.path.exists(config_path):
-        print(f"[ERROR] {config_path} not found")
+        print(f"[ERROR] {config_path} not found", flush=True)
         sys.exit(1)
 
     with open(config_path) as f:
@@ -41,16 +41,16 @@ def main(base_experiment: str, output_name: str, config_path: str):
     results_dir = os.path.join(base_experiment, "results")
     for d in [data_dir, checkpoint_dir, results_dir]:
         if not os.path.exists(d):
-            print(f"[ERROR] {d} not found")
+            print(f"[ERROR] {d} not found", flush=True)
             sys.exit(1)
 
     combos = list(itertools.product(N_SIGMA_VALUES, LAMBDA2_VALUES))
-    print(f"Grid search: {len(combos)} combinations x {N_SIMS} sims each")
-    print(f"  n_sigma:  {N_SIGMA_VALUES}")
-    print(f"  lambda2:  {LAMBDA2_VALUES}")
-    print(f"  Base:     {base_experiment}")
-    print(f"  Output:   output/{output_name}_*/")
-    print("=" * 60)
+    print(f"Grid search: {len(combos)} combinations x {N_SIMS} sims each", flush=True)
+    print(f"  n_sigma:  {N_SIGMA_VALUES}", flush=True)
+    print(f"  lambda2:  {LAMBDA2_VALUES}", flush=True)
+    print(f"  Base:     {base_experiment}", flush=True)
+    print(f"  Output:   output/{output_name}_*/", flush=True)
+    print("=" * 60, flush=True)
 
     # Add module dirs to path
     repo_root = os.path.dirname(os.path.abspath(__file__))
@@ -67,7 +67,7 @@ def main(base_experiment: str, output_name: str, config_path: str):
     # Load returns once
     data_files = [f for f in os.listdir(data_dir) if f.startswith("returns_") and f.endswith(".npy")]
     if not data_files:
-        print(f"[ERROR] No returns file found in {data_dir}")
+        print(f"[ERROR] No returns file found in {data_dir}", flush=True)
         sys.exit(1)
     returns = np.load(os.path.join(data_dir, data_files[0]))
 
@@ -92,10 +92,10 @@ def main(base_experiment: str, output_name: str, config_path: str):
         run_name = f"{output_name}_ns{n_sigma}_l2{lambda2}"
         run_dir = os.path.join("output", run_name)
 
-        print(f"\n{'=' * 60}")
-        print(f"[{i+1}/{len(combos)}] n_sigma={n_sigma}, lambda2={lambda2}")
-        print(f"  Output: {run_dir}")
-        print("=" * 60)
+        print(f"\n{'=' * 60}", flush=True)
+        print(f"[{i+1}/{len(combos)}] n_sigma={n_sigma}, lambda2={lambda2}", flush=True)
+        print(f"  Output: {run_dir}", flush=True)
+        print("=" * 60, flush=True)
 
         os.makedirs(run_dir, exist_ok=True)
 
@@ -114,8 +114,8 @@ def main(base_experiment: str, output_name: str, config_path: str):
         rl_cfg = {
             "predictor": base_config.get("rl", {}).get("predictor", "transformer"),
             "n_envs": base_config.get("rl", {}).get("n_envs", 32),
-            "n_iterations": base_config.get("rl", {}).get("n_iterations", 200),
-            "rollout_steps": base_config.get("rl", {}).get("rollout_steps", 512),
+            "n_iterations": base_config.get("rl", {}).get("n_iterations", 500),
+            "rollout_steps": base_config.get("rl", {}).get("rollout_steps", 2000),
             "lr": base_config.get("rl", {}).get("lr", 3e-4),
             "gamma": base_config.get("rl", {}).get("gamma", 0.99),
             "gae_lambda": base_config.get("rl", {}).get("gae_lambda", 0.95),
@@ -146,7 +146,7 @@ def main(base_experiment: str, output_name: str, config_path: str):
                 transformer_checkpoint=os.path.join(run_dir, "checkpoints"),
             )
         except Exception as e:
-            print(f"[ERROR] RL training failed: {e}")
+            print(f"[ERROR] RL training failed: {e}", flush=True)
             continue
 
         # Run N_SIMS simulations with different seeds
@@ -158,9 +158,9 @@ def main(base_experiment: str, output_name: str, config_path: str):
                 result = simulate(run_dir, seed=seed, deterministic=True)
                 sim_results.append(result["summary"])
                 print(f"  sim {s+1}/{N_SIMS}: seed={seed}  PnL={result['summary']['total_pnl']:.4f}  "
-                      f"Fills={result['summary']['n_total_fills']}  Avg|Pos|={result['summary']['avg_abs_position']:.2f}")
+                      f"Fills={result['summary']['n_total_fills']}  Avg|Pos|={result['summary']['avg_abs_position']:.2f}", flush=True)
             except Exception as e:
-                print(f"  sim {s+1}/{N_SIMS}: [ERROR] {e}")
+                print(f"  sim {s+1}/{N_SIMS}: [ERROR] {e}", flush=True)
 
         # Save aggregated sim summary
         if sim_results:
@@ -179,16 +179,16 @@ def main(base_experiment: str, output_name: str, config_path: str):
             with open(os.path.join(rl_dir, "sim_summary.json"), "w") as f:
                 json.dump(summary, f, indent=2)
             print(f"  Summary: PnL={summary['pnl_mean']:.4f} +/- {summary['pnl_std']:.4f}  "
-                  f"Avg|Pos|={summary['avg_position_mean']:.2f}  Fills={summary['avg_fills']:.0f}")
+                  f"Avg|Pos|={summary['avg_position_mean']:.2f}  Fills={summary['avg_fills']:.0f}", flush=True)
 
         elapsed = time.time() - t_start
-        print(f"[DONE] {run_name} in {elapsed:.1f}s")
+        print(f"[DONE] {run_name} in {elapsed:.1f}s", flush=True)
 
     total = time.time() - t_total
-    print(f"\n{'=' * 60}")
-    print(f"Grid search complete in {total:.1f}s")
-    print(f"Results in: output/{output_name}_*/")
-    print("=" * 60)
+    print(f"\n{'=' * 60}", flush=True)
+    print(f"Grid search complete in {total:.1f}s", flush=True)
+    print(f"Results in: output/{output_name}_*/", flush=True)
+    print("=" * 60, flush=True)
 
 
 if __name__ == "__main__":
