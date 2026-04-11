@@ -234,9 +234,9 @@ def train(
 
     print(
         f"\n{'Iter':>5} {'MeanRew':>10} {'PolLoss':>10} {'VLoss':>10} "
-        f"{'Entropy':>10} {'EntCoef':>10} {'RewStd':>10} {'Time':>8}"
+        f"{'Entropy':>10} {'KL':>10} {'EntCoef':>10} {'RewStd':>10} {'Time':>8}"
     )
-    print("-" * 82)
+    print("-" * 93)
 
     t_start = time.time()
 
@@ -294,6 +294,7 @@ def train(
         print(
             f"{iteration:5d} {mean_reward:10.4f} {metrics['policy_loss']:10.4f} "
             f"{metrics['value_loss']:10.4f} {metrics['entropy']:10.4f} "
+            f"{metrics['approx_kl']:10.4f} "
             f"{ent_coef:10.4f} {float(reward_rms.std):10.2f} {elapsed:7.1f}s"
         )
 

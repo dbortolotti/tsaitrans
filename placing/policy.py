@@ -49,9 +49,9 @@ class ActorCritic(nn.Module):
     def forward(self, obs):
         h = self.trunk(obs)
         mean = self.actor_mean(h)
-        # Clamp mean to [-1, 1] range (action space)
-        mean = torch.tanh(mean)
-        std = self.actor_log_std.exp().expand_as(mean)
+        # mean is raw (unsquashed) — tanh applied after sampling
+        log_std = torch.clamp(self.actor_log_std, -5.0, 2.0)
+        std = log_std.exp().expand_as(mean)
         value = self.critic(h).squeeze(-1)
         return mean, std, value
 
@@ -60,20 +60,25 @@ class ActorCritic(nn.Module):
         with torch.no_grad():
             mean, std, value = self.forward(obs)
             if deterministic:
-                action = mean
+                action = torch.tanh(mean)
+                log_prob = torch.zeros(mean.shape[0], device=mean.device)
             else:
                 dist = Normal(mean, std)
-                action = dist.sample()
-            action = action.clamp(-1.0, 1.0)
-            log_prob = Normal(mean, std).log_prob(action).sum(-1)
+                z = dist.sample()
+                action = torch.tanh(z)
+                # Tanh log-prob correction (Jacobian of the squashing)
+                log_prob = (dist.log_prob(z) - torch.log(1.0 - action.pow(2) + 1e-6)).sum(-1)
         return action.cpu().numpy(), log_prob.cpu().numpy(), value.cpu().numpy()
 
     def evaluate(self, obs, actions):
         """For PPO update. Returns log_prob, entropy, value."""
         mean, std, value = self.forward(obs)
+        # Invert tanh to recover pre-squash z
+        actions_c = actions.clamp(-0.999, 0.999)
+        z = torch.atanh(actions_c)
         dist = Normal(mean, std)
-        log_prob = dist.log_prob(actions).sum(-1)
-        entropy = dist.entropy().sum(-1)
+        log_prob = (dist.log_prob(z) - torch.log(1.0 - actions_c.pow(2) + 1e-6)).sum(-1)
+        entropy = dist.entropy().sum(-1)  # base Normal entropy (standard approx)
         return log_prob, entropy, value
 
 
@@ -193,14 +198,16 @@ def ppo_update(
     vf_coef: float = 0.5,
     ent_coef: float = 0.01,
     max_grad_norm: float = 0.5,
+    target_kl: float = 0.02,
 ):
     """Run PPO update on collected rollout data."""
     # Normalize advantages
     adv_flat = buffer.advantages.reshape(-1)
     adv_mean, adv_std = adv_flat.mean(), adv_flat.std() + 1e-8
 
-    metrics = {"policy_loss": 0, "value_loss": 0, "entropy": 0, "n_batches": 0}
+    metrics = {"policy_loss": 0, "value_loss": 0, "entropy": 0, "approx_kl": 0, "n_batches": 0}
 
+    early_stopped = False
     for _ in range(n_epochs):
         for obs, actions, old_lp, advantages, returns in buffer.get_batches(batch_size, device):
             # Normalize advantages per minibatch
@@ -227,10 +234,20 @@ def ppo_update(
             nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
             optimizer.step()
 
+            with torch.no_grad():
+                approx_kl = (old_lp - log_prob).mean().item()
+
             metrics["policy_loss"] += policy_loss.item()
             metrics["value_loss"] += value_loss.item()
             metrics["entropy"] += entropy.mean().item()
+            metrics["approx_kl"] += approx_kl
             metrics["n_batches"] += 1
+
+            if target_kl is not None and approx_kl > 1.5 * target_kl:
+                early_stopped = True
+                break
+        if early_stopped:
+            break
 
     # Average
     n = max(metrics["n_batches"], 1)
@@ -238,4 +255,6 @@ def ppo_update(
         "policy_loss": metrics["policy_loss"] / n,
         "value_loss": metrics["value_loss"] / n,
         "entropy": metrics["entropy"] / n,
+        "approx_kl": metrics["approx_kl"] / n,
+        "early_stopped": early_stopped,
     }
