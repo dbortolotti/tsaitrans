@@ -24,7 +24,10 @@ import time
 import numpy as np
 import torch
 
-from market_env import MarketMakingEnv, VectorizedMarketEnv
+from market_env import (
+    MarketMakingEnv, VectorizedMarketEnv,
+    SignalExposureEnv, VectorizedSignalExposureEnv,
+)
 from policy import ActorCritic, RolloutBuffer, RunningMeanStd, ppo_update
 
 
@@ -133,6 +136,104 @@ def momentum_predictor(returns, stock_indices, mean, std, horizons, lookback=10)
     return mu_predictions, sigma_predictions
 
 
+def evaluate_baseline(returns_list, mu_list, sigma_list, horizons, target_horizon,
+                      baseline_k=1.0, max_position=1.0, **env_kwargs):
+    """
+    Evaluate a deterministic linear baseline: position = clip(k * z_h, -max_pos, max_pos)
+    where z_h = mu_h / (sigma_h + eps) at the target horizon.
+
+    Returns dict of metrics.
+    """
+    # Find horizon index closest to target_horizon
+    h_idx = min(range(len(horizons)), key=lambda i: abs(horizons[i] - target_horizon))
+    actual_h = horizons[h_idx]
+    if actual_h != target_horizon:
+        print(f"[WARN] target_horizon={target_horizon} not in horizons={horizons}, "
+              f"using closest: {actual_h} (index {h_idx})")
+
+    all_rewards, all_positions, all_turnover = [], [], []
+
+    for ret, mu, sigma in zip(returns_list, mu_list, sigma_list):
+        env = SignalExposureEnv(ret, mu, sigma, target_horizon=target_horizon,
+                                max_position=max_position, **env_kwargs)
+        obs, _ = env.reset()
+        done = False
+        ep_rewards, ep_positions, ep_turnover = [], [], []
+
+        while not done:
+            # z-score at target horizon
+            mu_h = obs[3 + h_idx]
+            sigma_h = obs[3 + len(horizons) + h_idx]
+            z_h = mu_h / (sigma_h + 1e-8)
+            target_pos = np.clip(baseline_k * z_h, -max_position, max_position)
+            action = np.array([target_pos / max_position])  # map back to [-1, 1]
+
+            prev_pos = env.position
+            obs, rew, term, trunc, info = env.step(action)
+            done = term or trunc
+            ep_rewards.append(rew)
+            ep_positions.append(env.position)
+            ep_turnover.append(abs(env.position - prev_pos))
+
+        all_rewards.append(np.sum(ep_rewards))
+        all_positions.extend(ep_positions)
+        all_turnover.extend(ep_turnover)
+
+    metrics = {
+        "mean_episode_reward": float(np.mean(all_rewards)),
+        "std_episode_reward": float(np.std(all_rewards)),
+        "mean_abs_position": float(np.mean(np.abs(all_positions))),
+        "mean_turnover": float(np.mean(all_turnover)),
+        "n_episodes": len(returns_list),
+    }
+    return metrics
+
+
+def compute_rollout_diagnostics(actions_buf, obs_buf, horizons, target_horizon):
+    """
+    Compute per-iteration diagnostics from rollout data.
+
+    actions_buf: list of (n_envs, act_dim) arrays
+    obs_buf: list of (n_envs, obs_dim) arrays (pre-normalization)
+    """
+    actions = np.concatenate(actions_buf, axis=0)  # (steps*envs, act_dim)
+    obs = np.concatenate(obs_buf, axis=0)
+
+    # Find horizon index for target_horizon
+    h_idx = min(range(len(horizons)), key=lambda i: abs(horizons[i] - target_horizon))
+    H = len(horizons)
+
+    # Position is obs[:, 0] (position_normalized for signal_exposure)
+    positions = obs[:, 0]
+    mu_h = obs[:, 3 + h_idx]
+    sigma_h = obs[:, 3 + H + h_idx]
+    z_h = mu_h / (sigma_h + 1e-8)
+
+    mean_abs_action = float(np.mean(np.abs(actions)))
+    mean_abs_position = float(np.mean(np.abs(positions)))
+
+    # Turnover: abs change in position across consecutive steps (approximate)
+    turnover = float(np.mean(np.abs(np.diff(positions))))
+
+    # Fraction near-zero actions (|action| < 0.05)
+    frac_near_zero = float(np.mean(np.abs(actions) < 0.05))
+
+    # Correlation between action and z_h
+    if actions.shape[1] == 1:
+        action_flat = actions[:, 0]
+    else:
+        action_flat = actions[:, 1]  # skew dimension for market-making
+    corr = float(np.corrcoef(action_flat, z_h)[0, 1]) if len(action_flat) > 1 else 0.0
+
+    return {
+        "mean_abs_action": mean_abs_action,
+        "mean_abs_position": mean_abs_position,
+        "turnover": turnover,
+        "frac_near_zero": frac_near_zero,
+        "action_signal_corr": corr if np.isfinite(corr) else 0.0,
+    }
+
+
 def get_device():
     if torch.backends.mps.is_available():
         return torch.device("mps")
@@ -202,6 +303,7 @@ def train(
     print(f"[INFO] Horizons: {horizons} (H={H}, obs_dim={3 + 2*H})")
 
     # Extract config
+    reward_mode = config.get("reward_mode", "signal_exposure")
     n_envs = config.get("n_envs", 4)
     n_iterations = config.get("n_iterations", 500)
     rollout_steps = config.get("rollout_steps", 2048)
@@ -213,14 +315,21 @@ def train(
     ent_coef_end = config.get("ent_coef_end", 1e-5)
     target_kl = config.get("target_kl", 0.02)
 
-    # New env parameters
+    # Signal exposure params
+    target_horizon = config.get("target_horizon", 16)
+    reward_scale = config.get("reward_scale", 10.0)
+    alpha_pos = config.get("alpha_pos", 0.01)
+    beta_trade = config.get("beta_trade", 0.005)
+    max_position = config.get("max_position", 1.0)
+    baseline_k = config.get("baseline_k", 1.0)
+
+    # Market-making env parameters (used when reward_mode == "full_market_making")
     half_spread = config.get("half_spread", 0.001)
     target_vol = config.get("target_vol", 0.02)
 
     # Auto-load R² from transformer metrics if not explicitly set
     r_squared = config.get("r_squared", None)
     if r_squared is None and transformer_checkpoint:
-        # metrics.json lives in results/ sibling to checkpoints/
         experiment_dir = os.path.dirname(transformer_checkpoint)
         metrics_path = os.path.join(experiment_dir, "results", "metrics.json")
         if os.path.exists(metrics_path):
@@ -239,6 +348,30 @@ def train(
     T = returns.shape[0]
     n_rl_stocks = len(rl_train_stocks)
 
+    # Determine action dimension based on reward mode
+    if reward_mode == "signal_exposure":
+        act_dim = 1
+    else:
+        act_dim = 2
+
+    print(f"\n[INFO] === Phase 1 RL Config ===")
+    print(f"[INFO] reward_mode       = {reward_mode}")
+    print(f"[INFO] gamma             = {gamma}")
+    if reward_mode == "signal_exposure":
+        print(f"[INFO] target_horizon    = {target_horizon}")
+        print(f"[INFO] reward_scale      = {reward_scale}")
+        print(f"[INFO] alpha_pos         = {alpha_pos}")
+        print(f"[INFO] beta_trade        = {beta_trade}")
+        print(f"[INFO] max_position      = {max_position}")
+        print(f"[INFO] baseline_k        = {baseline_k}")
+    else:
+        print(f"[INFO] half_spread       = {half_spread}")
+        print(f"[INFO] target_vol        = {target_vol}")
+        print(f"[INFO] R²               = {r_squared}")
+        print(f"[INFO] n_sigma           = {n_sigma}")
+        print(f"[INFO] tau               = {tau}")
+        print(f"[INFO] lambda2           = {lambda2}")
+
     def make_env_data(n):
         """Create n episodes, each a full trading day from a random RL train stock."""
         ret_list, mu_list, sigma_list = [], [], []
@@ -251,12 +384,55 @@ def train(
             sigma_list.append(sigma_predictions[:, si, :]) # (T, H)
         return ret_list, mu_list, sigma_list
 
+    def make_vec_env(ret_list, mu_list, sigma_list):
+        """Create vectorized env based on reward_mode."""
+        if reward_mode == "signal_exposure":
+            return VectorizedSignalExposureEnv(
+                ret_list, mu_list, sigma_list,
+                target_horizon=target_horizon,
+                reward_scale=reward_scale,
+                alpha_pos=alpha_pos,
+                beta_trade=beta_trade,
+                max_position=max_position,
+            )
+        else:
+            return VectorizedMarketEnv(
+                ret_list, mu_list, sigma_list,
+                half_spread=half_spread,
+                target_vol=target_vol,
+                r_squared=r_squared,
+                n_sigma=n_sigma,
+                tau=tau,
+                lambda2=lambda2,
+                max_width=max_width,
+                max_skew=max_skew,
+            )
+
+    # --- Baseline evaluation (signal_exposure only) ---
+    if reward_mode == "signal_exposure":
+        print(f"\n[INFO] === Baseline Evaluation (k={baseline_k}) ===")
+        baseline_ret, baseline_mu, baseline_sigma = make_env_data(min(n_rl_stocks, 10))
+        baseline_metrics = evaluate_baseline(
+            baseline_ret, baseline_mu, baseline_sigma,
+            horizons=horizons,
+            target_horizon=target_horizon,
+            baseline_k=baseline_k,
+            max_position=max_position,
+            reward_scale=reward_scale,
+            alpha_pos=alpha_pos,
+            beta_trade=beta_trade,
+        )
+        print(f"[INFO] Baseline mean episode reward: {baseline_metrics['mean_episode_reward']:.4f} "
+              f"(±{baseline_metrics['std_episode_reward']:.4f})")
+        print(f"[INFO] Baseline mean |position|:     {baseline_metrics['mean_abs_position']:.4f}")
+        print(f"[INFO] Baseline mean turnover:        {baseline_metrics['mean_turnover']:.4f}")
+
     # Policy
     obs_dim = 3 + 2 * H
     log_std_init = config.get("log_std_init", -0.5)
     log_std_min = config.get("log_std_min", -3.0)
     log_std_max = config.get("log_std_max", 1.0)
-    policy = ActorCritic(obs_dim=obs_dim, act_dim=2, hidden=64,
+    policy = ActorCritic(obs_dim=obs_dim, act_dim=act_dim, hidden=64,
                          log_std_init=log_std_init,
                          log_std_min=log_std_min,
                          log_std_max=log_std_max).to(device)
@@ -270,21 +446,25 @@ def train(
     obs_rms = RunningMeanStd(shape=(obs_dim,))
 
     n_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
-    print(f"[INFO] Policy parameters: {n_params:,}", flush=True)
-    print(f"[INFO] Env params: half_spread={half_spread}, target_vol={target_vol}, "
-          f"R²={r_squared}, n_sigma={n_sigma}, tau={tau}, lambda2={lambda2}", flush=True)
+    print(f"\n[INFO] Policy parameters: {n_params:,}", flush=True)
+    print(f"[INFO] Action dim: {act_dim}", flush=True)
 
     os.makedirs(save_dir, exist_ok=True)
 
     best_reward = -np.inf
     log_rows = []
 
+    # Collapse detection state
+    low_action_streak = 0
+    COLLAPSE_WARN_THRESHOLD = 10  # warn after this many consecutive low-action iters
+
     print(
         f"\n{'Iter':>5} {'MeanRew':>10} {'PolLoss':>10} {'VLoss':>10} "
-        f"{'Entropy':>10} {'KL':>10} {'EntCoef':>10} {'LogStd':>10} {'RewStd':>10} {'Time':>8}",
+        f"{'Entropy':>10} {'KL':>10} {'|Act|':>8} {'|Pos|':>8} {'Corr':>8} "
+        f"{'LogStd':>8} {'RewStd':>10} {'Time':>7}",
         flush=True
     )
-    print("-" * 103, flush=True)
+    print("-" * 115, flush=True)
 
     t_start = time.time()
 
@@ -292,24 +472,14 @@ def train(
         iter_start = time.time()
 
         ret_list, mu_list, sigma_list = make_env_data(n_envs)
-        vec_env = VectorizedMarketEnv(
-            ret_list,
-            mu_list,
-            sigma_list,
-            half_spread=half_spread,
-            target_vol=target_vol,
-            r_squared=r_squared,
-            n_sigma=n_sigma,
-            tau=tau,
-            lambda2=lambda2,
-            max_width=max_width,
-            max_skew=max_skew,
-        )
+        vec_env = make_vec_env(ret_list, mu_list, sigma_list)
 
         buffer = RolloutBuffer()
         obs = vec_env.reset()
         obs_rms.update(obs)
         episode_rewards = []
+        raw_actions_buf = []
+        raw_obs_buf = []
 
         for step in range(rollout_steps):
             obs_norm = (obs - obs_rms.mean) / obs_rms.std
@@ -323,6 +493,8 @@ def train(
             rewards_norm = rewards / reward_rms.std
 
             buffer.add(obs_norm, actions, log_probs, rewards_norm, values, dones)
+            raw_actions_buf.append(actions.copy())
+            raw_obs_buf.append(obs.copy())
             obs = next_obs
             episode_rewards.append(rewards.mean())  # log raw rewards
 
@@ -336,19 +508,36 @@ def train(
         # Linear entropy coefficient anneal
         frac = iteration / max(n_iterations - 1, 1)
         ent_coef = ent_coef_start + (ent_coef_end - ent_coef_start) * frac
-        metrics = ppo_update(policy, optimizer, buffer, device,
-                             ent_coef=ent_coef, target_kl=target_kl)
+        ppo_metrics = ppo_update(policy, optimizer, buffer, device,
+                                 ent_coef=ent_coef, target_kl=target_kl)
+
+        # Diagnostics
+        diag = compute_rollout_diagnostics(raw_actions_buf, raw_obs_buf, horizons, target_horizon)
 
         mean_reward = np.mean(episode_rewards)
         log_std_val = policy.actor_log_std.data.mean().item()
-        kl_flag = " KL!" if metrics.get("early_stopped", False) else ""
+        kl_flag = " KL!" if ppo_metrics.get("early_stopped", False) else ""
         elapsed = time.time() - iter_start
+
+        # Collapse detection
+        if diag["mean_abs_action"] < 0.05:
+            low_action_streak += 1
+        else:
+            low_action_streak = 0
+        collapse_flag = ""
+        if low_action_streak >= COLLAPSE_WARN_THRESHOLD:
+            collapse_flag = " ⚠ COLLAPSE"
+        if ppo_metrics["entropy"] < 0.1:
+            collapse_flag += " ⚠ LOW-ENT"
+
         print(
-            f"{iteration:5d} {mean_reward:10.4f} {metrics['policy_loss']:10.4f} "
-            f"{metrics['value_loss']:10.4f} {metrics['entropy']:10.4f} "
-            f"{metrics['approx_kl']:10.4f} "
-            f"{ent_coef:10.4f} {log_std_val:10.4f} {float(reward_rms.std):10.2f} "
-            f"{elapsed:7.1f}s{kl_flag}",
+            f"{iteration:5d} {mean_reward:10.4f} {ppo_metrics['policy_loss']:10.4f} "
+            f"{ppo_metrics['value_loss']:10.4f} {ppo_metrics['entropy']:10.4f} "
+            f"{ppo_metrics['approx_kl']:10.4f} "
+            f"{diag['mean_abs_action']:8.4f} {diag['mean_abs_position']:8.4f} "
+            f"{diag['action_signal_corr']:8.4f} "
+            f"{log_std_val:8.4f} {float(reward_rms.std):10.2f} "
+            f"{elapsed:6.1f}s{kl_flag}{collapse_flag}",
             flush=True
         )
 
@@ -356,10 +545,12 @@ def train(
             {
                 "iteration": iteration,
                 "mean_reward": float(mean_reward),
-                **metrics,
+                "reward_std": float(np.std(episode_rewards)),
+                **ppo_metrics,
+                **diag,
                 "ent_coef": ent_coef,
                 "log_std": log_std_val,
-                "reward_std": float(reward_rms.std),
+                "reward_rms_std": float(reward_rms.std),
                 "obs_mean": obs_rms.mean.tolist(),
                 "obs_std": obs_rms.std.tolist(),
                 "elapsed": elapsed,
@@ -376,6 +567,21 @@ def train(
     print(f"\n[INFO] Training complete in {total_time:.1f}s", flush=True)
     print(f"[INFO] Best mean reward: {best_reward:.4f}", flush=True)
 
+    # Final summary
+    if len(log_rows) > 10:
+        last10 = log_rows[-10:]
+        avg_rew = np.mean([r["mean_reward"] for r in last10])
+        avg_act = np.mean([r["mean_abs_action"] for r in last10])
+        avg_corr = np.mean([r["action_signal_corr"] for r in last10])
+        print(f"[INFO] Last 10 iters: mean_reward={avg_rew:.4f}, "
+              f"|action|={avg_act:.4f}, signal_corr={avg_corr:.4f}")
+        if reward_mode == "signal_exposure":
+            print(f"[INFO] Baseline reward was: {baseline_metrics['mean_episode_reward']:.4f}")
+            if avg_rew > baseline_metrics["mean_episode_reward"]:
+                print("[INFO] ✓ PPO is beating the linear baseline")
+            else:
+                print("[INFO] ✗ PPO has not yet matched the linear baseline")
+
     torch.save(policy.state_dict(), os.path.join(save_dir, "final_policy.pt"))
     np.savez(os.path.join(save_dir, "final_normalizer.npz"),
              obs_mean=obs_rms.mean, obs_var=obs_rms.var, obs_count=obs_rms.count)
@@ -383,14 +589,17 @@ def train(
     with open(os.path.join(save_dir, "train_log.json"), "w") as f:
         json.dump(log_rows, f, indent=2)
 
-    rl_config = {
+    save_config = {
         **config,
+        "reward_mode": reward_mode,
         "stock_split": stock_split,
         "transformer_checkpoint": transformer_checkpoint,
         "total_time": total_time,
     }
+    if reward_mode == "signal_exposure":
+        save_config["baseline_metrics"] = baseline_metrics
     with open(os.path.join(save_dir, "config.json"), "w") as f:
-        json.dump(rl_config, f, indent=2)
+        json.dump(save_config, f, indent=2)
 
     print(f"[INFO] Saved to {save_dir}/")
 

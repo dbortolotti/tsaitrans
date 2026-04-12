@@ -59,6 +59,7 @@ DEFAULTS = {
     },
     "rl": {
         "predictor": "transformer",
+        "reward_mode": "signal_exposure",
         "n_envs": 4,
         "n_iterations": 500,
         "rollout_steps": 2048,
@@ -72,6 +73,14 @@ DEFAULTS = {
         "log_std_init": -0.5,
         "log_std_min": -3.0,
         "log_std_max": 1.0,
+        # signal_exposure params
+        "target_horizon": 16,
+        "reward_scale": 10.0,
+        "alpha_pos": 0.01,
+        "beta_trade": 0.005,
+        "max_position": 1.0,
+        "baseline_k": 1.0,
+        # full_market_making params
         "half_spread": 0.0005,
         "target_vol": 0.02,
         "n_sigma": 2.0,
@@ -153,6 +162,23 @@ def main(config_path: str, skip_data: bool = False, skip_transformer: bool = Fal
     print(f"Experiment: {name}")
     print(f"Output dir: {output_dir}")
 
+    # --- Resolve base_experiment (reuse data + transformer from another run) ---
+    base_experiment = config.get("base_experiment", None)
+    if base_experiment:
+        base_dir = os.path.join("output", base_experiment)
+        if not os.path.isdir(base_dir):
+            print(f"[ERROR] base_experiment '{base_experiment}' not found at {base_dir}")
+            sys.exit(1)
+        print(f"[INFO] Reusing data + transformer from base experiment: {base_experiment}")
+
+        # Load the base experiment's resolved config to get its data section for stock splits
+        base_resolved = os.path.join(base_dir, "resolved_config.json")
+        if os.path.exists(base_resolved):
+            with open(base_resolved) as f:
+                base_config = json.load(f)
+            # Use base experiment's data config for stock split (must match)
+            config["data"] = base_config["data"]
+
     # --- Compute stock split ---
     data_cfg = config["data"]
     stock_split = compute_stock_split(data_cfg)
@@ -170,90 +196,118 @@ def main(config_path: str, skip_data: bool = False, skip_transformer: bool = Fal
         if d not in sys.path:
             sys.path.insert(0, d)
 
-    data_dir = os.path.join(output_dir, "data")
-    checkpoint_dir = os.path.join(output_dir, "checkpoints")
-    results_dir = os.path.join(output_dir, "results")
-    rl_dir = os.path.join(output_dir, "checkpoints_rl")
+    if base_experiment:
+        # Point data and checkpoint dirs at the base experiment
+        data_dir = os.path.join(base_dir, "data")
+        checkpoint_dir = os.path.join(base_dir, "checkpoints")
+        # Results and RL output go to this experiment's own dir
+        results_dir = os.path.join(output_dir, "results")
+        rl_dir = os.path.join(output_dir, "checkpoints_rl")
 
-    # === Stage 1: Generate data ===
-    data_file = os.path.join(data_dir, f"returns_{name}.npy")
-    if skip_data and os.path.exists(data_file):
-        print("\n[SKIP] Stage 1: loading existing data")
+        # Find the data file (named after the base experiment)
+        data_files = [f for f in os.listdir(data_dir) if f.startswith("returns_") and f.endswith(".npy")]
+        if not data_files:
+            print(f"[ERROR] No returns file found in {data_dir}")
+            sys.exit(1)
+        data_file = os.path.join(data_dir, data_files[0])
         returns = np.load(data_file).astype(np.float32)
+        print(f"\n[REUSE] Loaded data from {data_file} — shape {returns.shape}")
+
+        checkpoint_file = os.path.join(checkpoint_dir, "best_model.pt")
+        if not os.path.exists(checkpoint_file):
+            print(f"[ERROR] No transformer checkpoint found at {checkpoint_file}")
+            sys.exit(1)
+        print(f"[REUSE] Using transformer checkpoint from {checkpoint_dir}")
+
+        # Skip stages 1–4
+        skip_data = True
+        skip_transformer = True
+        skip_backtest = True
     else:
-        if skip_data:
-            ans = input("\n[WARN] --skip-data: no existing data found. Generate now? [Y/n] ").strip().lower()
-            if ans == "n":
-                print("Aborting.")
-                sys.exit(1)
-        print("\n" + "=" * 60)
-        print("STAGE 1: Generate data")
-        print("=" * 60)
+        data_dir = os.path.join(output_dir, "data")
+        checkpoint_dir = os.path.join(output_dir, "checkpoints")
+        results_dir = os.path.join(output_dir, "results")
+        rl_dir = os.path.join(output_dir, "checkpoints_rl")
 
-        from generate_data import generate, save
+        # === Stage 1: Generate data ===
+        data_file = os.path.join(data_dir, f"returns_{name}.npy")
+        if skip_data and os.path.exists(data_file):
+            print("\n[SKIP] Stage 1: loading existing data")
+            returns = np.load(data_file).astype(np.float32)
+        else:
+            if skip_data:
+                ans = input("\n[WARN] --skip-data: no existing data found. Generate now? [Y/n] ").strip().lower()
+                if ans == "n":
+                    print("Aborting.")
+                    sys.exit(1)
+            print("\n" + "=" * 60)
+            print("STAGE 1: Generate data")
+            print("=" * 60)
 
-        n_steps = data_cfg["n_steps"]
-        result = generate(
-            n_stocks=n_stocks,
-            n_timesteps=n_steps,
-            n_factors=data_cfg["n_factors"],
-            factor_half_life=data_cfg["factor_half_life"],
-            noise_half_life_range=tuple(data_cfg["noise_half_life_range"]),
-            target_vol=data_cfg["target_vol"],
-            snr=data_cfg["snr"],
-            steps_per_day=data_cfg["steps_per_day"],
-            seed=data_cfg["seed"],
-        )
+            from generate_data import generate, save
 
-        save(result, data_dir, name)
-        returns = result["returns"].astype(np.float32)
+            n_steps = data_cfg["n_steps"]
+            result = generate(
+                n_stocks=n_stocks,
+                n_timesteps=n_steps,
+                n_factors=data_cfg["n_factors"],
+                factor_half_life=data_cfg["factor_half_life"],
+                noise_half_life_range=tuple(data_cfg["noise_half_life_range"]),
+                target_vol=data_cfg["target_vol"],
+                snr=data_cfg["snr"],
+                steps_per_day=data_cfg["steps_per_day"],
+                seed=data_cfg["seed"],
+            )
 
-    # === Stage 2: Train transformer ===
-    checkpoint_file = os.path.join(checkpoint_dir, "best_model.pt")
-    if skip_transformer and os.path.exists(checkpoint_file):
-        print("[SKIP] Stage 2: reusing existing transformer checkpoint")
-    else:
-        if skip_transformer:
-            ans = input("[WARN] --skip-transformer: no checkpoint found. Train now? [Y/n] ").strip().lower()
-            if ans == "n":
-                print("Aborting.")
-                sys.exit(1)
-        print("\n" + "=" * 60)
-        print("STAGE 2: Train transformer")
-        print("=" * 60)
+            save(result, data_dir, name)
+            returns = result["returns"].astype(np.float32)
 
-        from train import train as train_transformer
+        # === Stage 2: Train transformer ===
+        checkpoint_file = os.path.join(checkpoint_dir, "best_model.pt")
+        if skip_transformer and os.path.exists(checkpoint_file):
+            print("[SKIP] Stage 2: reusing existing transformer checkpoint")
+        else:
+            if skip_transformer:
+                ans = input("[WARN] --skip-transformer: no checkpoint found. Train now? [Y/n] ").strip().lower()
+                if ans == "n":
+                    print("Aborting.")
+                    sys.exit(1)
+            print("\n" + "=" * 60)
+            print("STAGE 2: Train transformer")
+            print("=" * 60)
 
-        transformer_cfg = config["transformer"]
-        train_transformer(transformer_cfg, returns, stock_split, checkpoint_dir)
+            from train import train as train_transformer
 
-    # === Stage 3: Transformer inference on test stocks ===
-    if skip_transformer and os.path.exists(checkpoint_file):
-        print("[SKIP] Stage 3: skipping inference (transformer was skipped)")
-    else:
-        print("\n" + "=" * 60)
-        print("STAGE 3: Transformer inference (test stocks)")
-        print("=" * 60)
+            transformer_cfg = config["transformer"]
+            train_transformer(transformer_cfg, returns, stock_split, checkpoint_dir)
 
-        from inference import run_inference
+        # === Stage 3: Transformer inference on test stocks ===
+        if skip_transformer and os.path.exists(checkpoint_file):
+            print("[SKIP] Stage 3: skipping inference (transformer was skipped)")
+        else:
+            print("\n" + "=" * 60)
+            print("STAGE 3: Transformer inference (test stocks)")
+            print("=" * 60)
 
-        run_inference(checkpoint_dir, returns, stock_split["test"], results_dir)
+            from inference import run_inference
 
-    # === Stage 4: Phase 0 analytical backtest ===
-    backtest_dir = os.path.join(output_dir, "backtest")
-    if skip_backtest or skip_transformer:
-        print("[SKIP] Stage 4: backtest skipped")
-    else:
-        print("\n" + "=" * 60)
-        print("STAGE 4: Phase 0 analytical backtest")
-        print("=" * 60)
+            run_inference(checkpoint_dir, returns, stock_split["test"], results_dir)
 
-        from backtest import run_backtest
+        # === Stage 4: Phase 0 analytical backtest ===
+        backtest_dir = os.path.join(output_dir, "backtest")
+        if skip_backtest or skip_transformer:
+            print("[SKIP] Stage 4: backtest skipped")
+        else:
+            print("\n" + "=" * 60)
+            print("STAGE 4: Phase 0 analytical backtest")
+            print("=" * 60)
 
-        rl_half_spread = config["rl"].get("half_spread", 0.0005)
-        # Test on RL train stocks (same stocks RL will use)
-        run_backtest(checkpoint_dir, returns, stock_split["rl_train"],
-                     backtest_dir, half_spread=rl_half_spread)
+            from backtest import run_backtest
+
+            rl_half_spread = config["rl"].get("half_spread", 0.0005)
+            # Test on RL train stocks (same stocks RL will use)
+            run_backtest(checkpoint_dir, returns, stock_split["rl_train"],
+                         backtest_dir, half_spread=rl_half_spread)
 
     # === Stage 5: Train RL ===
     if skip_rl:

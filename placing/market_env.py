@@ -247,6 +247,166 @@ class MarketMakingEnv(gym.Env):
         return {k: list(v) for k, v in self.log.items()}
 
 
+class SignalExposureEnv(gym.Env):
+    """
+    Simplified environment for Phase 1 RL: learn to map predictive signal to
+    directional exposure.
+
+    Action: 1D continuous [-1, 1], mapped to [-max_position, max_position].
+    Reward: reward_scale * position * target_return
+            - alpha_pos * position^2
+            - beta_trade * (position - prev_position)^2
+
+    No fills, no spread mechanics — just position management against future returns.
+    """
+
+    metadata = {"render_modes": []}
+
+    def __init__(
+        self,
+        returns: np.ndarray,              # (T,) single-stock return series
+        mu_predictions: np.ndarray,       # (T, H) predicted cumulative returns per horizon
+        sigma_predictions: np.ndarray,    # (T, H) uncertainty per horizon
+        target_horizon: int = 16,
+        reward_scale: float = 10.0,
+        alpha_pos: float = 0.01,
+        beta_trade: float = 0.005,
+        max_position: float = 1.0,
+        **kwargs,                         # absorb unused market-making params
+    ):
+        super().__init__()
+
+        self.returns = returns.astype(np.float64)
+        self.mu_predictions = mu_predictions.astype(np.float64)
+        self.sigma_predictions = sigma_predictions.astype(np.float64)
+        self.T = len(returns)
+        self.H = mu_predictions.shape[1]
+
+        self.target_horizon = target_horizon
+        self.reward_scale = reward_scale
+        self.alpha_pos = alpha_pos
+        self.beta_trade = beta_trade
+        self.max_position = max_position
+
+        # Precompute cumulative prices for target return calculation
+        self.cum_returns = np.cumsum(self.returns)  # cumulative sum of returns
+
+        # Observation: [position_normalized, time_remaining, cumulative_reward,
+        #               mu_1..mu_H, sigma_1..sigma_H]
+        obs_dim = 3 + 2 * self.H
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float64
+        )
+        # 1D action: target position in [-1, 1], scaled to [-max_position, max_position]
+        self.action_space = spaces.Box(
+            low=-1.0, high=1.0, shape=(1,), dtype=np.float64
+        )
+
+        self.reset()
+
+    def _target_return(self, t):
+        """Realized future return over target_horizon steps from time t."""
+        end = min(t + self.target_horizon, self.T)
+        if end <= t:
+            return 0.0
+        return float(self.returns[t:end].sum())
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.t = 0
+        self.position = 0.0
+        self.cumulative_reward = 0.0
+
+        # Logging for diagnostics
+        self.log = {
+            "positions": [], "actions": [], "rewards": [],
+            "target_returns": [], "turnover": [],
+        }
+
+        return self._get_obs(), {}
+
+    def _get_obs(self):
+        position_norm = self.position / self.max_position  # [-1, 1]
+        time_remaining = (self.T - self.t) / self.T
+
+        if self.t < self.T:
+            mu = self.mu_predictions[self.t]
+            sigma = self.sigma_predictions[self.t]
+        else:
+            mu = np.zeros(self.H)
+            sigma = np.ones(self.H)
+
+        return np.concatenate([
+            [position_norm, time_remaining, self.cumulative_reward],
+            mu,
+            sigma,
+        ]).astype(np.float64)
+
+    def step(self, action):
+        if self.t >= self.T - 1:
+            return self._get_obs(), 0.0, True, False, {}
+
+        # Map action to target position
+        new_position = float(np.clip(action[0], -1.0, 1.0)) * self.max_position
+        prev_position = self.position
+
+        # Target return (realized future return over horizon)
+        target_ret = self._target_return(self.t)
+
+        # Phase 1 reward
+        reward = (
+            self.reward_scale * new_position * target_ret
+            - self.alpha_pos * new_position ** 2
+            - self.beta_trade * (new_position - prev_position) ** 2
+        )
+
+        self.position = new_position
+        self.cumulative_reward += reward
+
+        # Logging
+        self.log["positions"].append(new_position)
+        self.log["actions"].append(float(action[0]))
+        self.log["rewards"].append(reward)
+        self.log["target_returns"].append(target_ret)
+        self.log["turnover"].append(abs(new_position - prev_position))
+
+        self.t += 1
+        terminated = self.t >= self.T - 1
+
+        return self._get_obs(), reward, terminated, False, {}
+
+    def get_log(self):
+        return {k: list(v) for k, v in self.log.items()}
+
+
+class VectorizedSignalExposureEnv:
+    """Runs N independent SignalExposureEnv instances in parallel."""
+
+    def __init__(self, returns_list, mu_list, sigma_list, **kwargs):
+        self.envs = [
+            SignalExposureEnv(r, mu, sigma, **kwargs)
+            for r, mu, sigma in zip(returns_list, mu_list, sigma_list)
+        ]
+        self.n_envs = len(self.envs)
+
+    def reset(self):
+        obs = np.stack([env.reset()[0] for env in self.envs])
+        return obs
+
+    def step(self, actions):
+        """actions: (n_envs, 1)"""
+        obs_list, rew_list, done_list = [], [], []
+        for i, env in enumerate(self.envs):
+            obs, rew, term, trunc, info = env.step(actions[i])
+            done = term or trunc
+            if done:
+                obs, _ = env.reset()
+            obs_list.append(obs)
+            rew_list.append(rew)
+            done_list.append(done)
+        return np.stack(obs_list), np.array(rew_list), np.array(done_list)
+
+
 class VectorizedMarketEnv:
     """
     Runs N independent MarketMakingEnv instances in parallel (numpy-vectorized).

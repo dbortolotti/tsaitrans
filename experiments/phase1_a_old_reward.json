@@ -1,0 +1,12 @@
+{
+  "base_experiment": "experiment4",
+  "rl": {
+    "predictor": "transformer",
+    "reward_mode": "full_market_making",
+    "half_spread": 0.001,
+    "n_sigma": 1.0,
+    "lambda2": 1.5,
+    "gamma": 0.99,
+    "n_iterations": 300
+  }
+}
