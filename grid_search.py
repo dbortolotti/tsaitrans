@@ -20,8 +20,8 @@ import time
 
 
 # --- Grid ---
-N_SIGMA_VALUES = [0, 0.05, 0.1, 0.2, 0.3, 1]
-LAMBDA2_VALUES = [1.0, 2.0, 3.0, 10, 100]
+N_SIGMA_VALUES = [0.0, 0.1, 0.2, 0.5, 1.0, 2.0]
+LAMBDA2_VALUES = [0.0, 1.5, 10.0]
 
 N_SIMS = 10
 
@@ -111,14 +111,22 @@ def main(base_experiment: str, output_name: str, config_path: str):
             os.symlink(target, link)
 
         # Build RL config
+        rl_base = base_config.get("rl", {})
         rl_cfg = {
-            "predictor": base_config.get("rl", {}).get("predictor", "transformer"),
-            "n_envs": base_config.get("rl", {}).get("n_envs", 32),
-            "n_iterations": base_config.get("rl", {}).get("n_iterations", 500),
-            "rollout_steps": base_config.get("rl", {}).get("rollout_steps", 2000),
-            "lr": base_config.get("rl", {}).get("lr", 3e-4),
-            "gamma": base_config.get("rl", {}).get("gamma", 0.99),
-            "gae_lambda": base_config.get("rl", {}).get("gae_lambda", 0.95),
+            "predictor": rl_base.get("predictor", "transformer"),
+            "n_envs": rl_base.get("n_envs", 4),
+            "n_iterations": rl_base.get("n_iterations", 500),
+            "rollout_steps": rl_base.get("rollout_steps", 2048),
+            "actor_lr": rl_base.get("actor_lr", 3e-4),
+            "critic_lr": rl_base.get("critic_lr", 1e-3),
+            "gamma": rl_base.get("gamma", 0.99),
+            "gae_lambda": rl_base.get("gae_lambda", 0.95),
+            "ent_coef": rl_base.get("ent_coef", 5e-4),
+            "ent_coef_end": rl_base.get("ent_coef_end", 1e-5),
+            "target_kl": rl_base.get("target_kl", 0.02),
+            "log_std_init": rl_base.get("log_std_init", -0.5),
+            "log_std_min": rl_base.get("log_std_min", -3.0),
+            "log_std_max": rl_base.get("log_std_max", 1.0),
             "half_spread": 0.0005,
             "target_vol": data_cfg.get("target_vol", 0.02),
             "tau": 20,

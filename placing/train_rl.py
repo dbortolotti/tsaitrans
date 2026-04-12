@@ -168,14 +168,16 @@ def train(
     print(f"[INFO] Normalization: mean={norm_mean:.4f}, std={norm_std:.4f}")
 
     # Extract config
-    n_envs = config.get("n_envs", 32)
+    n_envs = config.get("n_envs", 4)
     n_iterations = config.get("n_iterations", 500)
-    rollout_steps = config.get("rollout_steps", 2000)
-    lr = config.get("lr", 3e-4)
+    rollout_steps = config.get("rollout_steps", 2048)
+    actor_lr = config.get("actor_lr", 3e-4)
+    critic_lr = config.get("critic_lr", 1e-3)
     gamma = config.get("gamma", 0.99)
     lam = config.get("gae_lambda", 0.95)
-    ent_coef_start = config.get("ent_coef", 0.01)
-    ent_coef_end = config.get("ent_coef_end", 0.001)
+    ent_coef_start = config.get("ent_coef", 5e-4)
+    ent_coef_end = config.get("ent_coef_end", 1e-5)
+    target_kl = config.get("target_kl", 0.02)
 
     # New env parameters
     half_spread = config.get("half_spread", 0.001)
@@ -194,7 +196,7 @@ def train(
             print(f"[INFO] Auto-loaded R²={r_squared:.4f} from transformer metrics")
     if r_squared is None:
         r_squared = 0.01
-    n_sigma = config.get("n_sigma", 1.0)
+    n_sigma = config.get("n_sigma", 2.0)
     tau = config.get("tau", 20)
     lambda2 = config.get("lambda2", 1.5)
     max_width = config.get("max_width", 3.0)
@@ -215,17 +217,26 @@ def train(
         return ret_list, pred_list
 
     # Policy
-    policy = ActorCritic(obs_dim=4, act_dim=2, hidden=64).to(device)
-    optimizer = torch.optim.Adam(policy.parameters(), lr=lr, eps=1e-5)
+    log_std_init = config.get("log_std_init", -0.5)
+    log_std_min = config.get("log_std_min", -3.0)
+    log_std_max = config.get("log_std_max", 1.0)
+    policy = ActorCritic(obs_dim=4, act_dim=2, hidden=64,
+                         log_std_init=log_std_init,
+                         log_std_min=log_std_min,
+                         log_std_max=log_std_max).to(device)
+    optimizer = torch.optim.Adam([
+        {"params": policy.actor_params(), "lr": actor_lr},
+        {"params": policy.critic_params(), "lr": critic_lr},
+    ], eps=1e-5)
 
     # Reward and observation normalization for stable PPO training
     reward_rms = RunningMeanStd(shape=())
     obs_rms = RunningMeanStd(shape=(4,))
 
     n_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
-    print(f"[INFO] Policy parameters: {n_params:,}")
+    print(f"[INFO] Policy parameters: {n_params:,}", flush=True)
     print(f"[INFO] Env params: half_spread={half_spread}, target_vol={target_vol}, "
-          f"R²={r_squared}, n_sigma={n_sigma}, tau={tau}, lambda2={lambda2}")
+          f"R²={r_squared}, n_sigma={n_sigma}, tau={tau}, lambda2={lambda2}", flush=True)
 
     os.makedirs(save_dir, exist_ok=True)
 
@@ -234,9 +245,10 @@ def train(
 
     print(
         f"\n{'Iter':>5} {'MeanRew':>10} {'PolLoss':>10} {'VLoss':>10} "
-        f"{'Entropy':>10} {'KL':>10} {'EntCoef':>10} {'RewStd':>10} {'Time':>8}"
+        f"{'Entropy':>10} {'KL':>10} {'EntCoef':>10} {'LogStd':>10} {'RewStd':>10} {'Time':>8}",
+        flush=True
     )
-    print("-" * 93)
+    print("-" * 103, flush=True)
 
     t_start = time.time()
 
@@ -287,15 +299,20 @@ def train(
         # Linear entropy coefficient anneal
         frac = iteration / max(n_iterations - 1, 1)
         ent_coef = ent_coef_start + (ent_coef_end - ent_coef_start) * frac
-        metrics = ppo_update(policy, optimizer, buffer, device, ent_coef=ent_coef)
+        metrics = ppo_update(policy, optimizer, buffer, device,
+                             ent_coef=ent_coef, target_kl=target_kl)
 
         mean_reward = np.mean(episode_rewards)
+        log_std_val = policy.actor_log_std.data.mean().item()
+        kl_flag = " KL!" if metrics.get("early_stopped", False) else ""
         elapsed = time.time() - iter_start
         print(
             f"{iteration:5d} {mean_reward:10.4f} {metrics['policy_loss']:10.4f} "
             f"{metrics['value_loss']:10.4f} {metrics['entropy']:10.4f} "
             f"{metrics['approx_kl']:10.4f} "
-            f"{ent_coef:10.4f} {float(reward_rms.std):10.2f} {elapsed:7.1f}s"
+            f"{ent_coef:10.4f} {log_std_val:10.4f} {float(reward_rms.std):10.2f} "
+            f"{elapsed:7.1f}s{kl_flag}",
+            flush=True
         )
 
         log_rows.append(
@@ -303,6 +320,8 @@ def train(
                 "iteration": iteration,
                 "mean_reward": float(mean_reward),
                 **metrics,
+                "ent_coef": ent_coef,
+                "log_std": log_std_val,
                 "reward_std": float(reward_rms.std),
                 "obs_mean": obs_rms.mean.tolist(),
                 "obs_std": obs_rms.std.tolist(),
@@ -317,8 +336,8 @@ def train(
                      obs_mean=obs_rms.mean, obs_var=obs_rms.var, obs_count=obs_rms.count)
 
     total_time = time.time() - t_start
-    print(f"\n[INFO] Training complete in {total_time:.1f}s")
-    print(f"[INFO] Best mean reward: {best_reward:.4f}")
+    print(f"\n[INFO] Training complete in {total_time:.1f}s", flush=True)
+    print(f"[INFO] Best mean reward: {best_reward:.4f}", flush=True)
 
     torch.save(policy.state_dict(), os.path.join(save_dir, "final_policy.pt"))
     np.savez(os.path.join(save_dir, "final_normalizer.npz"),
@@ -347,14 +366,15 @@ if __name__ == "__main__":
     parser.add_argument("--split", type=str, required=True,
                         help='JSON string with stock split')
     parser.add_argument("--save_dir", type=str, default="checkpoints_rl/run1")
-    parser.add_argument("--n_envs", type=int, default=32)
-    parser.add_argument("--n_iterations", type=int, default=200)
-    parser.add_argument("--rollout_steps", type=int, default=512)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--n_envs", type=int, default=4)
+    parser.add_argument("--n_iterations", type=int, default=500)
+    parser.add_argument("--rollout_steps", type=int, default=2048)
+    parser.add_argument("--actor_lr", type=float, default=3e-4)
+    parser.add_argument("--critic_lr", type=float, default=1e-3)
     parser.add_argument("--half_spread", type=float, default=0.001)
     parser.add_argument("--target_vol", type=float, default=0.02)
     parser.add_argument("--r_squared", type=float, default=0.01)
-    parser.add_argument("--n_sigma", type=float, default=1.0)
+    parser.add_argument("--n_sigma", type=float, default=2.0)
     parser.add_argument("--tau", type=int, default=20)
     parser.add_argument("--lambda2", type=float, default=1.5)
     args = parser.parse_args()

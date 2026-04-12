@@ -19,8 +19,12 @@ class ActorCritic(nn.Module):
     Log-std is a learnable parameter (state-independent).
     """
 
-    def __init__(self, obs_dim=4, act_dim=2, hidden=64):
+    def __init__(self, obs_dim=4, act_dim=2, hidden=64,
+                 log_std_init=-0.5, log_std_min=-3.0, log_std_max=1.0):
         super().__init__()
+
+        self.log_std_min = log_std_min
+        self.log_std_max = log_std_max
 
         self.trunk = nn.Sequential(
             nn.Linear(obs_dim, hidden),
@@ -30,7 +34,7 @@ class ActorCritic(nn.Module):
         )
 
         self.actor_mean = nn.Linear(hidden, act_dim)
-        self.actor_log_std = nn.Parameter(torch.zeros(act_dim))  # learnable
+        self.actor_log_std = nn.Parameter(torch.full((act_dim,), log_std_init))
 
         self.critic = nn.Linear(hidden, 1)
 
@@ -50,7 +54,7 @@ class ActorCritic(nn.Module):
         h = self.trunk(obs)
         mean = self.actor_mean(h)
         # mean is raw (unsquashed) — tanh applied after sampling
-        log_std = torch.clamp(self.actor_log_std, -5.0, 2.0)
+        log_std = torch.clamp(self.actor_log_std, self.log_std_min, self.log_std_max)
         std = log_std.exp().expand_as(mean)
         value = self.critic(h).squeeze(-1)
         return mean, std, value
@@ -80,6 +84,14 @@ class ActorCritic(nn.Module):
         log_prob = (dist.log_prob(z) - torch.log(1.0 - actions_c.pow(2) + 1e-6)).sum(-1)
         entropy = dist.entropy().sum(-1)  # base Normal entropy (standard approx)
         return log_prob, entropy, value
+
+    def actor_params(self):
+        """Actor parameters (trunk + actor head + log_std)."""
+        return list(self.trunk.parameters()) + list(self.actor_mean.parameters()) + [self.actor_log_std]
+
+    def critic_params(self):
+        """Critic parameters (critic head only)."""
+        return list(self.critic.parameters())
 
 
 class RunningMeanStd:
@@ -192,11 +204,11 @@ def ppo_update(
     optimizer: torch.optim.Optimizer,
     buffer: RolloutBuffer,
     device: torch.device,
-    n_epochs: int = 4,
-    batch_size: int = 256,
+    n_epochs: int = 10,
+    batch_size: int = 512,
     clip_eps: float = 0.2,
     vf_coef: float = 0.5,
-    ent_coef: float = 0.01,
+    ent_coef: float = 5e-4,
     max_grad_norm: float = 0.5,
     target_kl: float = 0.02,
 ):
@@ -204,6 +216,10 @@ def ppo_update(
     # Normalize advantages
     adv_flat = buffer.advantages.reshape(-1)
     adv_mean, adv_std = adv_flat.mean(), adv_flat.std() + 1e-8
+
+    # Normalize value targets (returns)
+    ret_flat = buffer.returns.reshape(-1)
+    ret_mean, ret_std = ret_flat.mean(), ret_flat.std() + 1e-8
 
     metrics = {"policy_loss": 0, "value_loss": 0, "entropy": 0, "approx_kl": 0, "n_batches": 0}
 
@@ -221,8 +237,9 @@ def ppo_update(
             surr2 = ratio.clamp(1.0 - clip_eps, 1.0 + clip_eps) * advantages
             policy_loss = -torch.min(surr1, surr2).mean()
 
-            # Value loss
-            value_loss = nn.functional.mse_loss(values, returns)
+            # Value loss (normalized targets)
+            returns_norm = (returns - ret_mean) / ret_std
+            value_loss = nn.functional.mse_loss(values, returns_norm)
 
             # Entropy bonus
             entropy_loss = -entropy.mean()
