@@ -61,8 +61,9 @@ def simulate():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Serve trading visualizer with live simulation")
+    parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
 
-    print(f"Open http://localhost:{args.port}")
-    app.run(host="0.0.0.0", port=args.port, debug=False)
+    print(f"Serving on http://{args.host}:{args.port}")
+    app.run(host=args.host, port=args.port, debug=False)
