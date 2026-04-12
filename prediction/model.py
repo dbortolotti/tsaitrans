@@ -165,13 +165,15 @@ class FactorTransformer(nn.Module):
     Encoder-only transformer for univariate time series forecasting.
 
     Input:  (batch, context_len, 1)
-    Output: (batch, horizon, 1)
+    Output:
+        - deterministic: (batch, horizon, 1)
+        - probabilistic: ((batch, horizon, 1), (batch, horizon, 1))  — (mu, log_sigma)
 
     Architecture:
         1. Linear input projection: 1 -> d_model
         2. Sinusoidal positional encoding
         3. N x TransformerEncoderLayer (self-attention + FFN + LayerNorm)
-        4. Linear output head: d_model -> horizon
+        4. Output head(s): d_model -> horizon (+ uncertainty head if probabilistic)
     """
 
     def __init__(
@@ -184,12 +186,14 @@ class FactorTransformer(nn.Module):
         n_layers: int = 3,
         ffn_dim: int = 256,
         dropout: float = 0.1,
+        probabilistic: bool = False,
     ):
         super().__init__()
         self.n_stocks = n_stocks
         self.context_len = context_len
         self.horizon = horizon
         self.d_model = d_model
+        self.probabilistic = probabilistic
 
         # 1. Project each timestep's value into d_model space
         self.input_proj = nn.Linear(n_stocks, d_model)
@@ -210,8 +214,12 @@ class FactorTransformer(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers, enable_nested_tensor=False)
 
-        # 4. Output head: use only the last timestep's representation
+        # 4. Output head: mean prediction
         self.output_head = nn.Linear(d_model, n_stocks * horizon)
+
+        # 5. Uncertainty head (probabilistic mode only)
+        if probabilistic:
+            self.log_sigma_head = nn.Linear(d_model, n_stocks * horizon)
 
         self._init_weights()
 
@@ -221,19 +229,35 @@ class FactorTransformer(nn.Module):
         nn.init.zeros_(self.input_proj.bias)
         nn.init.xavier_uniform_(self.output_head.weight)
         nn.init.zeros_(self.output_head.bias)
+        if self.probabilistic:
+            nn.init.xavier_uniform_(self.log_sigma_head.weight)
+            # Init bias to small negative value so initial sigma ~ 0.5
+            nn.init.constant_(self.log_sigma_head.bias, -0.5)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor):
         """
         x: (batch, context_len, n_stocks)
-        returns: (batch, horizon, n_stocks)
+
+        Returns:
+            deterministic: (batch, horizon, n_stocks)
+            probabilistic: tuple of (mu, log_sigma), each (batch, horizon, n_stocks)
         """
         x = self.input_proj(x)  # (batch, context_len, d_model)
         x = self.pos_enc(x)
         x = self.encoder(x)  # (batch, context_len, d_model)
         x = x[:, -1, :]  # (batch, d_model)
-        x = self.output_head(x)  # (batch, n_stocks * horizon)
-        x = x.view(-1, self.horizon, self.n_stocks)
-        return x
+
+        mu = self.output_head(x)  # (batch, n_stocks * horizon)
+        mu = mu.view(-1, self.horizon, self.n_stocks)
+
+        if self.probabilistic:
+            log_sigma = self.log_sigma_head(x)
+            log_sigma = log_sigma.view(-1, self.horizon, self.n_stocks)
+            # Clamp for numerical stability
+            log_sigma = torch.clamp(log_sigma, -4.0, 2.0)
+            return mu, log_sigma
+
+        return mu
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)

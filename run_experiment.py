@@ -44,7 +44,7 @@ DEFAULTS = {
     },
     "transformer": {
         "context_len": 200,
-        "horizon": 1,
+        "horizon": 10,
         "d_model": 64,
         "n_heads": 4,
         "n_layers": 3,
@@ -55,6 +55,7 @@ DEFAULTS = {
         "n_epochs": 100,
         "patience": 15,
         "seed": 42,
+        "probabilistic": True,
     },
     "rl": {
         "predictor": "transformer",
@@ -121,7 +122,8 @@ def compute_stock_split(data_config: dict) -> dict:
     return split
 
 
-def main(config_path: str, skip_data: bool = False, skip_transformer: bool = False, skip_rl: bool = False):
+def main(config_path: str, skip_data: bool = False, skip_transformer: bool = False,
+         skip_backtest: bool = False, skip_rl: bool = False):
     # --- Load and merge config ---
     with open(config_path) as f:
         user_config = json.load(f)
@@ -234,12 +236,28 @@ def main(config_path: str, skip_data: bool = False, skip_transformer: bool = Fal
 
         run_inference(checkpoint_dir, returns, stock_split["test"], results_dir)
 
-    # === Stage 4: Train RL ===
-    if skip_rl:
-        print("[SKIP] Stage 4: RL training skipped")
+    # === Stage 4: Phase 0 analytical backtest ===
+    backtest_dir = os.path.join(output_dir, "backtest")
+    if skip_backtest or skip_transformer:
+        print("[SKIP] Stage 4: backtest skipped")
     else:
         print("\n" + "=" * 60)
-        print("STAGE 4: Train RL agent")
+        print("STAGE 4: Phase 0 analytical backtest")
+        print("=" * 60)
+
+        from backtest import run_backtest
+
+        rl_half_spread = config["rl"].get("half_spread", 0.0005)
+        # Test on RL train stocks (same stocks RL will use)
+        run_backtest(checkpoint_dir, returns, stock_split["rl_train"],
+                     backtest_dir, half_spread=rl_half_spread)
+
+    # === Stage 5: Train RL ===
+    if skip_rl:
+        print("[SKIP] Stage 5: RL training skipped")
+    else:
+        print("\n" + "=" * 60)
+        print("STAGE 5: Train RL agent")
         print("=" * 60)
 
         from train_rl import train as train_rl
@@ -263,8 +281,11 @@ if __name__ == "__main__":
                         help="Skip stage 1 (data generation) and reuse existing data")
     parser.add_argument("--skip-transformer", action="store_true",
                         help="Skip stages 2-3 (transformer training + inference) and reuse existing checkpoint")
+    parser.add_argument("--skip-backtest", action="store_true",
+                        help="Skip stage 4 (analytical backtest)")
     parser.add_argument("--skip-rl", action="store_true",
-                        help="Skip stage 4 (RL training)")
+                        help="Skip stage 5 (RL training)")
     args = parser.parse_args()
 
-    main(args.config, skip_data=args.skip_data, skip_transformer=args.skip_transformer, skip_rl=args.skip_rl)
+    main(args.config, skip_data=args.skip_data, skip_transformer=args.skip_transformer,
+         skip_backtest=args.skip_backtest, skip_rl=args.skip_rl)

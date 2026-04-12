@@ -87,6 +87,7 @@ def train(config: dict, returns: np.ndarray, stock_split: dict, save_dir: str):
     )
 
     # Model — univariate (n_stocks=1)
+    probabilistic = config.get("probabilistic", False)
     model = FactorTransformer(
         n_stocks=1,
         context_len=context_len,
@@ -96,8 +97,11 @@ def train(config: dict, returns: np.ndarray, stock_split: dict, save_dir: str):
         n_layers=config.get("n_layers", 3),
         ffn_dim=config.get("ffn_dim", 256),
         dropout=config.get("dropout", 0.1),
+        probabilistic=probabilistic,
     ).to(device)
     print(f"Parameters: {model.count_parameters():,}")
+    if probabilistic:
+        print("Mode: probabilistic (heteroscedastic NLL loss)")
 
     n_epochs = config.get("n_epochs", 50)
     lr = config.get("lr", 3e-4)
@@ -108,12 +112,13 @@ def train(config: dict, returns: np.ndarray, stock_split: dict, save_dir: str):
     warmup_steps = int(0.05 * total_steps)
     scheduler = cosine_with_warmup(optimizer, warmup_steps, total_steps)
 
-    criterion = nn.MSELoss()
+    if not probabilistic:
+        criterion = nn.MSELoss()
 
     os.makedirs(save_dir, exist_ok=True)
 
     # Save config
-    full_config = {**config, "n_stocks": 1, "stock_split": stock_split}
+    full_config = {**config, "n_stocks": 1, "probabilistic": probabilistic, "stock_split": stock_split}
     with open(os.path.join(save_dir, "config.json"), "w") as f:
         json.dump(full_config, f, indent=2)
 
@@ -137,8 +142,13 @@ def train(config: dict, returns: np.ndarray, stock_split: dict, save_dir: str):
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
-            pred = model(x)
-            loss = criterion(pred, y)
+            if probabilistic:
+                mu, log_sigma = model(x)
+                # Heteroscedastic NLL: (y - mu)^2 / sigma^2 + 2*log_sigma
+                loss = ((y - mu) ** 2 / torch.exp(2 * log_sigma) + 2 * log_sigma).mean()
+            else:
+                pred = model(x)
+                loss = criterion(pred, y)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -151,8 +161,13 @@ def train(config: dict, returns: np.ndarray, stock_split: dict, save_dir: str):
         with torch.no_grad():
             for x, y in val_loader:
                 x, y = x.to(device), y.to(device)
-                pred = model(x)
-                val_loss += criterion(pred, y).item()
+                if probabilistic:
+                    mu, log_sigma = model(x)
+                    loss = ((y - mu) ** 2 / torch.exp(2 * log_sigma) + 2 * log_sigma).mean()
+                    val_loss += loss.item()
+                else:
+                    pred = model(x)
+                    val_loss += criterion(pred, y).item()
         val_loss /= len(val_loader)
 
         elapsed = time.time() - t_start
@@ -209,6 +224,8 @@ if __name__ == "__main__":
     parser.add_argument("--n_epochs", type=int, default=50)
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--probabilistic", action="store_true",
+                        help="Enable probabilistic mode (heteroscedastic NLL)")
     args = parser.parse_args()
 
     returns = np.load(args.data)

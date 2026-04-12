@@ -82,16 +82,19 @@ def main(experiment_dir: str, seed: int = None, deterministic: bool = False):
         tf_config = json.load(f)
 
     context_len = tf_config.get("context_len", 60)
+    probabilistic = tf_config.get("probabilistic", False)
+    horizon = tf_config.get("horizon", 1)
 
     model = FactorTransformer(
         n_stocks=1,
         context_len=context_len,
-        horizon=tf_config.get("horizon", 1),
+        horizon=horizon,
         d_model=tf_config.get("d_model", 64),
         n_heads=tf_config.get("n_heads", 4),
         n_layers=tf_config.get("n_layers", 3),
         ffn_dim=tf_config.get("ffn_dim", 256),
         dropout=0.0,
+        probabilistic=probabilistic,
     ).to(device)
 
     ckpt = torch.load(
@@ -103,6 +106,8 @@ def main(experiment_dir: str, seed: int = None, deterministic: bool = False):
     model.eval()
 
     # Generate predictions in normalized space
+    # For probabilistic models: z-score = mu_total / sigma_total
+    # For deterministic models: sum of horizon predictions
     predictions = np.zeros(T, dtype=np.float32)
     normed_series = (returns_raw - norm_mean) / norm_std
 
@@ -110,16 +115,28 @@ def main(experiment_dir: str, seed: int = None, deterministic: bool = False):
         for t in range(context_len, T):
             window = normed_series[t - context_len : t].reshape(1, context_len, 1)
             x = torch.tensor(window, dtype=torch.float32, device=device)
-            pred = model(x)
-            predictions[t] = pred[0, 0, 0].item()
+            if probabilistic:
+                mu, log_sigma = model(x)
+                mu_total = mu[0, :, 0].sum().item()
+                sigma_total = torch.exp(log_sigma[0, :, 0]).pow(2).sum().sqrt().item()
+                predictions[t] = mu_total / (sigma_total + 1e-8)
+            else:
+                pred = model(x)
+                predictions[t] = pred[0, :, 0].sum().item()
 
-    print(f"[INFO] Transformer predictions generated")
+    mode = "z-score" if probabilistic else "deterministic"
+    print(f"[INFO] Transformer predictions generated [{mode}, H={horizon}]")
 
     # --- Load RL policy ---
     from policy import ActorCritic
 
     rl_dir = os.path.join(experiment_dir, "checkpoints_rl")
-    policy = ActorCritic(obs_dim=4, act_dim=2, hidden=64).to(device)
+    policy = ActorCritic(
+        obs_dim=4, act_dim=2, hidden=64,
+        log_std_init=rl_cfg.get("log_std_init", -0.5),
+        log_std_min=rl_cfg.get("log_std_min", -3.0),
+        log_std_max=rl_cfg.get("log_std_max", 1.0),
+    ).to(device)
 
     policy_path = os.path.join(rl_dir, "best_policy.pt")
     norm_path = os.path.join(rl_dir, "best_normalizer.npz")

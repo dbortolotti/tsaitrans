@@ -31,7 +31,12 @@ from policy import ActorCritic, RolloutBuffer, RunningMeanStd, ppo_update
 def load_transformer_predictions(returns, stock_indices, checkpoint_dir):
     """
     Load trained univariate transformer and generate predictions for specified stocks.
-    Returns (T, len(stock_indices)) array of predicted next-step returns in normalized space.
+
+    For deterministic models:
+        Returns (T, len(stock_indices)) array of predicted next-step returns in normalized space.
+    For probabilistic models:
+        Returns z-scores: z = mu_total / sigma_total aggregated over the prediction horizon.
+
     Also returns (mean, std) used for normalization.
     """
     try:
@@ -49,15 +54,19 @@ def load_transformer_predictions(returns, stock_indices, checkpoint_dir):
         mean = float(np.load(os.path.join(checkpoint_dir, "mean.npy")))
         std = float(np.load(os.path.join(checkpoint_dir, "std.npy")))
 
+        probabilistic = config.get("probabilistic", False)
+        horizon = config.get("horizon", 1)
+
         model = FactorTransformer(
             n_stocks=1,
             context_len=config.get("context_len", 60),
-            horizon=config.get("horizon", 1),
+            horizon=horizon,
             d_model=config.get("d_model", 64),
             n_heads=config.get("n_heads", 4),
             n_layers=config.get("n_layers", 3),
             ffn_dim=config.get("ffn_dim", 256),
             dropout=0.0,
+            probabilistic=probabilistic,
         ).to(device)
 
         ckpt = torch.load(
@@ -72,7 +81,6 @@ def load_transformer_predictions(returns, stock_indices, checkpoint_dir):
         predictions = np.zeros((T, len(stock_indices)))
         ctx_len = config.get("context_len", 60)
 
-        # Predictions stay in normalized space (O(1) magnitude)
         with torch.no_grad():
             for si, stock_idx in enumerate(stock_indices):
                 series = returns[:, stock_idx]
@@ -80,10 +88,20 @@ def load_transformer_predictions(returns, stock_indices, checkpoint_dir):
                 for t in range(ctx_len, T):
                     window = normed[t - ctx_len : t].reshape(1, ctx_len, 1)
                     x = torch.tensor(window, dtype=torch.float32, device=device)
-                    pred = model(x)  # (1, 1, 1)
-                    predictions[t, si] = pred[0, 0, 0].item()
 
-        print(f"[INFO] Loaded transformer predictions from {checkpoint_dir}")
+                    if probabilistic:
+                        mu, log_sigma = model(x)  # each (1, horizon, 1)
+                        # Aggregate: z = sum(mu) / sqrt(sum(sigma^2))
+                        mu_total = mu[0, :, 0].sum().item()
+                        sigma_total = torch.exp(log_sigma[0, :, 0]).pow(2).sum().sqrt().item()
+                        predictions[t, si] = mu_total / (sigma_total + 1e-8)
+                    else:
+                        pred = model(x)  # (1, horizon, 1)
+                        # For multi-horizon deterministic, sum predictions
+                        predictions[t, si] = pred[0, :, 0].sum().item()
+
+        mode = "z-score (probabilistic)" if probabilistic else "deterministic"
+        print(f"[INFO] Loaded transformer predictions from {checkpoint_dir} [{mode}, H={horizon}]")
         return predictions, mean, std
 
     except Exception as e:
