@@ -30,21 +30,22 @@ from policy import ActorCritic, RolloutBuffer, RunningMeanStd, ppo_update
 
 def load_transformer_predictions(returns, stock_indices, checkpoint_dir):
     """
-    Load trained univariate transformer and generate predictions for specified stocks.
+    Load trained univariate transformer and generate per-horizon predictions.
 
-    For deterministic models:
-        Returns (T, len(stock_indices)) array of predicted next-step returns in normalized space.
-    For probabilistic models:
-        Returns z-scores: z = mu_total / sigma_total aggregated over the prediction horizon.
+    Returns:
+        mu_predictions: (T, n_stocks, H) predicted cumulative returns per horizon
+        sigma_predictions: (T, n_stocks, H) uncertainty per horizon (ones if deterministic)
+        mean, std: normalization stats
+        horizons: list of horizon values
 
-    Also returns (mean, std) used for normalization.
+    No aggregation is performed — the full multi-horizon structure is preserved.
     """
     try:
         pred_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "prediction")
         if pred_dir not in sys.path:
             sys.path.insert(0, pred_dir)
 
-        from model import FactorTransformer
+        from model import FactorTransformer, normalize_horizons
 
         device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
@@ -55,12 +56,13 @@ def load_transformer_predictions(returns, stock_indices, checkpoint_dir):
         std = float(np.load(os.path.join(checkpoint_dir, "std.npy")))
 
         probabilistic = config.get("probabilistic", False)
-        horizon = config.get("horizon", 1)
+        horizons = normalize_horizons(config)
+        H = len(horizons)
 
         model = FactorTransformer(
             n_stocks=1,
             context_len=config.get("context_len", 60),
-            horizon=horizon,
+            horizons=horizons,
             d_model=config.get("d_model", 64),
             n_heads=config.get("n_heads", 4),
             n_layers=config.get("n_layers", 3),
@@ -78,7 +80,9 @@ def load_transformer_predictions(returns, stock_indices, checkpoint_dir):
         model.eval()
 
         T = returns.shape[0]
-        predictions = np.zeros((T, len(stock_indices)))
+        n_stocks = len(stock_indices)
+        mu_predictions = np.zeros((T, n_stocks, H))
+        sigma_predictions = np.ones((T, n_stocks, H))  # ones default for deterministic
         ctx_len = config.get("context_len", 60)
 
         with torch.no_grad():
@@ -90,19 +94,17 @@ def load_transformer_predictions(returns, stock_indices, checkpoint_dir):
                     x = torch.tensor(window, dtype=torch.float32, device=device)
 
                     if probabilistic:
-                        mu, log_sigma = model(x)  # each (1, horizon, 1)
-                        # Aggregate: z = sum(mu) / sqrt(sum(sigma^2))
-                        mu_total = mu[0, :, 0].sum().item()
-                        sigma_total = torch.exp(log_sigma[0, :, 0]).pow(2).sum().sqrt().item()
-                        predictions[t, si] = mu_total / (sigma_total + 1e-8)
+                        mu, log_sigma = model(x)  # each (1, H, 1)
+                        mu_predictions[t, si, :] = mu[0, :, 0].cpu().numpy()
+                        sigma_predictions[t, si, :] = torch.exp(log_sigma[0, :, 0]).cpu().numpy()
                     else:
-                        pred = model(x)  # (1, horizon, 1)
-                        # For multi-horizon deterministic, sum predictions
-                        predictions[t, si] = pred[0, :, 0].sum().item()
+                        pred = model(x)  # (1, H, 1)
+                        mu_predictions[t, si, :] = pred[0, :, 0].cpu().numpy()
 
-        mode = "z-score (probabilistic)" if probabilistic else "deterministic"
-        print(f"[INFO] Loaded transformer predictions from {checkpoint_dir} [{mode}, H={horizon}]")
-        return predictions, mean, std
+        mode = "probabilistic" if probabilistic else "deterministic"
+        print(f"[INFO] Loaded transformer predictions from {checkpoint_dir} "
+              f"[{mode}, horizons={horizons}]")
+        return mu_predictions, sigma_predictions, mean, std, horizons
 
     except Exception as e:
         print(f"[WARN] Could not load transformer: {e}")
@@ -110,18 +112,25 @@ def load_transformer_predictions(returns, stock_indices, checkpoint_dir):
         return None
 
 
-def momentum_predictor(returns, stock_indices, mean, std, lookback=10):
+def momentum_predictor(returns, stock_indices, mean, std, horizons, lookback=10):
     """
     Simple momentum predictor in normalized space.
-    Returns (T, len(stock_indices)) of normalized predictions.
+    Returns (mu, sigma) each of shape (T, len(stock_indices), H).
+    Sigma is constant ones (no uncertainty estimate from momentum).
     """
     T = returns.shape[0]
-    predictions = np.zeros((T, len(stock_indices)))
+    H = len(horizons)
+    n_stocks = len(stock_indices)
+    mu_predictions = np.zeros((T, n_stocks, H))
+    sigma_predictions = np.ones((T, n_stocks, H))
     for si, stock_idx in enumerate(stock_indices):
         normed = (returns[:, stock_idx] - mean) / std
         for t in range(lookback, T):
-            predictions[t, si] = normed[t - lookback : t].mean()
-    return predictions
+            mom = normed[t - lookback : t].mean()
+            # Scale momentum signal by horizon (longer horizon = larger expected move)
+            for hi, h in enumerate(horizons):
+                mu_predictions[t, si, hi] = mom * h
+    return mu_predictions, sigma_predictions
 
 
 def get_device():
@@ -159,15 +168,14 @@ def train(
     # Get predictions and normalization stats
     predictor = config.get("predictor", "transformer")
     norm_mean, norm_std = None, None
+    mu_predictions, sigma_predictions, horizons = None, None, None
 
     if predictor == "transformer" and transformer_checkpoint:
         result = load_transformer_predictions(
             returns, rl_train_stocks, transformer_checkpoint
         )
         if result is not None:
-            predictions, norm_mean, norm_std = result
-        else:
-            predictions = None
+            mu_predictions, sigma_predictions, norm_mean, norm_std, horizons = result
 
     # Fallback: compute normalization from transformer checkpoint or RL train stocks
     if norm_mean is None or norm_std is None:
@@ -179,11 +187,19 @@ def train(
             norm_mean = float(train_data.mean())
             norm_std = float(train_data.std()) + 1e-8
 
-    if predictions is None:
-        predictions = momentum_predictor(returns, rl_train_stocks, norm_mean, norm_std)
+    # Default horizons if not loaded from transformer
+    if horizons is None:
+        horizons = config.get("horizons", [1, 2, 4, 8, 16])
+    H = len(horizons)
+
+    if mu_predictions is None:
+        mu_predictions, sigma_predictions = momentum_predictor(
+            returns, rl_train_stocks, norm_mean, norm_std, horizons
+        )
         print("[INFO] Using momentum predictor")
 
     print(f"[INFO] Normalization: mean={norm_mean:.4f}, std={norm_std:.4f}")
+    print(f"[INFO] Horizons: {horizons} (H={H}, obs_dim={3 + 2*H})")
 
     # Extract config
     n_envs = config.get("n_envs", 4)
@@ -225,20 +241,22 @@ def train(
 
     def make_env_data(n):
         """Create n episodes, each a full trading day from a random RL train stock."""
-        ret_list, pred_list = [], []
+        ret_list, mu_list, sigma_list = [], [], []
         rng = np.random.default_rng()
         for _ in range(n):
             si = rng.integers(0, n_rl_stocks)
             stock_idx = rl_train_stocks[si]
             ret_list.append(returns[:, stock_idx])
-            pred_list.append(predictions[:, si])
-        return ret_list, pred_list
+            mu_list.append(mu_predictions[:, si, :])      # (T, H)
+            sigma_list.append(sigma_predictions[:, si, :]) # (T, H)
+        return ret_list, mu_list, sigma_list
 
     # Policy
+    obs_dim = 3 + 2 * H
     log_std_init = config.get("log_std_init", -0.5)
     log_std_min = config.get("log_std_min", -3.0)
     log_std_max = config.get("log_std_max", 1.0)
-    policy = ActorCritic(obs_dim=4, act_dim=2, hidden=64,
+    policy = ActorCritic(obs_dim=obs_dim, act_dim=2, hidden=64,
                          log_std_init=log_std_init,
                          log_std_min=log_std_min,
                          log_std_max=log_std_max).to(device)
@@ -249,7 +267,7 @@ def train(
 
     # Reward and observation normalization for stable PPO training
     reward_rms = RunningMeanStd(shape=())
-    obs_rms = RunningMeanStd(shape=(4,))
+    obs_rms = RunningMeanStd(shape=(obs_dim,))
 
     n_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     print(f"[INFO] Policy parameters: {n_params:,}", flush=True)
@@ -273,10 +291,11 @@ def train(
     for iteration in range(n_iterations):
         iter_start = time.time()
 
-        ret_list, pred_list = make_env_data(n_envs)
+        ret_list, mu_list, sigma_list = make_env_data(n_envs)
         vec_env = VectorizedMarketEnv(
             ret_list,
-            pred_list,
+            mu_list,
+            sigma_list,
             half_spread=half_spread,
             target_vol=target_vol,
             r_squared=r_squared,

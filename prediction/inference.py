@@ -26,20 +26,25 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from model import FactorTransformer, TimeSeriesDataset, get_device
+from model import FactorTransformer, TimeSeriesDataset, get_device, normalize_horizons
 
 
-def compute_metrics(pred: np.ndarray, target: np.ndarray, sigma: np.ndarray = None) -> dict:
+def compute_metrics(pred: np.ndarray, target: np.ndarray, sigma: np.ndarray = None,
+                    horizons: list = None) -> dict:
     """
-    pred, target: (n_samples, horizon, 1)
-    sigma: (n_samples, horizon, 1) — optional, from probabilistic model
+    pred, target: (n_samples, num_horizons, 1)
+    sigma: (n_samples, num_horizons, 1) — optional, from probabilistic model
+    horizons: list of horizon values, e.g. [1, 2, 4, 8, 16]
     Returns dict of scalar metrics.
     """
+    if horizons is None:
+        horizons = list(range(1, pred.shape[1] + 1))
+
     mse = np.mean((pred - target) ** 2)
     mae = np.mean(np.abs(pred - target))
     rmse = np.sqrt(mse)
 
-    # Directional accuracy
+    # Directional accuracy (shortest horizon)
     dir_acc = np.mean(np.sign(pred[:, 0, :]) == np.sign(target[:, 0, :]))
 
     # Naive baseline: predict zero
@@ -55,20 +60,32 @@ def compute_metrics(pred: np.ndarray, target: np.ndarray, sigma: np.ndarray = No
         "r2_vs_naive": float(r2),
     }
 
+    # Per-horizon metrics
+    for i, h in enumerate(horizons):
+        h_mse = np.mean((pred[:, i, :] - target[:, i, :]) ** 2)
+        h_naive = np.mean(target[:, i, :] ** 2)
+        metrics[f"r2_h{h}"] = float(1.0 - h_mse / (h_naive + 1e-10))
+        metrics[f"dir_acc_h{h}"] = float(
+            np.mean(np.sign(pred[:, i, :]) == np.sign(target[:, i, :]))
+        )
+
     if sigma is not None:
-        # NLL (heteroscedastic)
+        # NLL (heteroscedastic, per-element)
         nll = np.mean((target - pred) ** 2 / (sigma ** 2 + 1e-8) + 2 * np.log(sigma + 1e-8))
         metrics["nll"] = float(nll)
         metrics["mean_sigma"] = float(np.mean(sigma))
 
-        # Z-score signal: aggregate over horizon
-        mu_total = pred.sum(axis=1)        # (n_samples, 1)
-        sigma_total = np.sqrt((sigma ** 2).sum(axis=1))  # (n_samples, 1)
-        z = mu_total / (sigma_total + 1e-8)              # (n_samples, 1)
-        metrics["mean_abs_z"] = float(np.mean(np.abs(z)))
-        metrics["median_abs_z"] = float(np.median(np.abs(z)))
-        metrics["z_gt_1_frac"] = float(np.mean(np.abs(z) > 1.0))
-        metrics["z_gt_2_frac"] = float(np.mean(np.abs(z) > 2.0))
+        # Per-horizon z-scores (no cross-horizon aggregation)
+        for i, h in enumerate(horizons):
+            z_h = pred[:, i, 0] / (sigma[:, i, 0] + 1e-8)
+            metrics[f"mean_abs_z_h{h}"] = float(np.mean(np.abs(z_h)))
+
+        # Summary z-score using longest horizon
+        z_long = pred[:, -1, 0] / (sigma[:, -1, 0] + 1e-8)
+        metrics["mean_abs_z"] = float(np.mean(np.abs(z_long)))
+        metrics["median_abs_z"] = float(np.median(np.abs(z_long)))
+        metrics["z_gt_1_frac"] = float(np.mean(np.abs(z_long) > 1.0))
+        metrics["z_gt_2_frac"] = float(np.mean(np.abs(z_long) > 2.0))
 
     return metrics
 
@@ -103,19 +120,20 @@ def run_inference(
     std = float(np.load(os.path.join(checkpoint_dir, "std.npy")))
 
     context_len = config.get("context_len", 60)
-    horizon = config.get("horizon", 1)
+    horizons = normalize_horizons(config)
 
     # Test dataset
-    test_ds = TimeSeriesDataset(returns, test_stocks, context_len, horizon, mean, std)
+    test_ds = TimeSeriesDataset(returns, test_stocks, context_len, horizons=horizons, mean=mean, std=std)
     test_loader = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=0)
     print(f"Test stocks: {test_stocks} ({len(test_ds)} samples)")
+    print(f"Horizons: {horizons}")
 
     # Rebuild model
     probabilistic = config.get("probabilistic", False)
     model = FactorTransformer(
         n_stocks=1,
         context_len=context_len,
-        horizon=horizon,
+        horizons=horizons,
         d_model=config.get("d_model", 64),
         n_heads=config.get("n_heads", 4),
         n_layers=config.get("n_layers", 3),
@@ -151,18 +169,23 @@ def run_inference(
     sigmas = np.concatenate(all_sigmas, axis=0) if all_sigmas else None
 
     # Metrics
-    metrics = compute_metrics(preds, targets, sigmas)
+    metrics = compute_metrics(preds, targets, sigmas, horizons=horizons)
     print("\n--- Test Metrics (normalised space) ---")
     for k, v in metrics.items():
-        print(f"  {k}: {v:.4f}")
+        if isinstance(v, float):
+            print(f"  {k}: {v:.4f}")
 
     if metrics["r2_vs_naive"] < 0:
         print("\n  WARNING: R² < 0. Model is worse than predicting zero.")
     elif metrics["r2_vs_naive"] < 0.02:
         print("\n  NOTE: R² is near zero. Normal for high-noise returns.")
 
+    print(f"\n--- Per-Horizon R² ---")
+    for h in horizons:
+        print(f"  h={h:3d}: R²={metrics[f'r2_h{h}']:.4f}  dir_acc={metrics[f'dir_acc_h{h}']:.4f}")
+
     if probabilistic:
-        print(f"\n--- Z-Score Signal Summary ---")
+        print(f"\n--- Z-Score Signal Summary (longest horizon h={horizons[-1]}) ---")
         print(f"  mean |z|:  {metrics['mean_abs_z']:.4f}")
         print(f"  |z| > 1:   {metrics['z_gt_1_frac']:.1%}")
         print(f"  |z| > 2:   {metrics['z_gt_2_frac']:.1%}")
@@ -171,7 +194,8 @@ def run_inference(
     os.makedirs(results_dir, exist_ok=True)
     metrics_path = os.path.join(results_dir, "metrics.json")
     with open(metrics_path, "w") as f:
-        json.dump({**metrics, "test_stocks": test_stocks, "probabilistic": probabilistic}, f, indent=2)
+        json.dump({**metrics, "test_stocks": test_stocks, "probabilistic": probabilistic,
+                   "horizons": horizons}, f, indent=2)
     print(f"\nMetrics saved: {metrics_path}")
 
     # Plot
@@ -180,7 +204,7 @@ def run_inference(
 
     if probabilistic:
         zscore_plot_path = os.path.join(results_dir, "zscore_distribution.png")
-        _plot_zscore_distribution(preds, sigmas, test_stocks, zscore_plot_path)
+        _plot_zscore_distribution(preds, sigmas, test_stocks, zscore_plot_path, horizons=horizons)
 
     return metrics
 
@@ -235,40 +259,42 @@ def _plot_predictions(preds, targets, test_stocks, n_plot_stocks, save_path):
     print(f"Plot saved: {save_path}")
 
 
-def _plot_zscore_distribution(preds, sigmas, test_stocks, save_path):
-    """Plot z-score distribution and signal calibration."""
-    mu_total = preds.sum(axis=1).squeeze(-1)          # (n_samples,)
-    sigma_total = np.sqrt((sigmas ** 2).sum(axis=1)).squeeze(-1)
-    z = mu_total / (sigma_total + 1e-8)
+def _plot_zscore_distribution(preds, sigmas, test_stocks, save_path, horizons=None):
+    """Plot per-horizon z-score distributions and signal calibration."""
+    if horizons is None:
+        horizons = list(range(1, preds.shape[1] + 1))
 
+    n_horizons = len(horizons)
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
-    # Z-score histogram
+    # Per-horizon z-score histograms (overlay)
     ax = axes[0]
-    ax.hist(z, bins=100, density=True, alpha=0.7, edgecolor="none")
+    for i, h in enumerate(horizons):
+        z_h = preds[:, i, 0] / (sigmas[:, i, 0] + 1e-8)
+        ax.hist(z_h, bins=80, density=True, alpha=0.4, label=f"h={h}")
     ax.axvline(1.0, color="r", linestyle="--", alpha=0.5, label="|z|=1")
     ax.axvline(-1.0, color="r", linestyle="--", alpha=0.5)
-    ax.axvline(2.0, color="orange", linestyle="--", alpha=0.5, label="|z|=2")
-    ax.axvline(-2.0, color="orange", linestyle="--", alpha=0.5)
-    ax.set_title("Z-Score Distribution")
-    ax.set_xlabel("z = μ_total / σ_total")
-    ax.legend(fontsize=7)
+    ax.set_title("Per-Horizon Z-Score Distributions")
+    ax.set_xlabel("z_h = μ_h / σ_h")
+    ax.legend(fontsize=6)
     ax.grid(True, alpha=0.3)
 
-    # Sigma distribution
+    # Per-horizon sigma distribution
     ax = axes[1]
-    mean_sigma = sigmas.mean(axis=1).squeeze(-1)
-    ax.hist(mean_sigma, bins=100, density=True, alpha=0.7, edgecolor="none")
-    ax.set_title("Mean σ Distribution")
-    ax.set_xlabel("σ (per horizon step)")
+    for i, h in enumerate(horizons):
+        ax.hist(sigmas[:, i, 0], bins=80, density=True, alpha=0.4, label=f"h={h}")
+    ax.set_title("Per-Horizon σ Distribution")
+    ax.set_xlabel("σ_h")
+    ax.legend(fontsize=6)
     ax.grid(True, alpha=0.3)
 
-    # |mu_total| vs cost threshold
+    # Longest-horizon signal magnitude
     ax = axes[2]
-    abs_mu = np.abs(mu_total)
-    ax.hist(abs_mu, bins=100, density=True, alpha=0.7, edgecolor="none", label="|μ_total|")
-    ax.set_title("|μ_total| — Signal Magnitude")
-    ax.set_xlabel("|μ_total| (normalised)")
+    abs_mu_long = np.abs(preds[:, -1, 0])
+    ax.hist(abs_mu_long, bins=100, density=True, alpha=0.7, edgecolor="none",
+            label=f"|μ_h{horizons[-1]}|")
+    ax.set_title(f"|μ| — Longest Horizon (h={horizons[-1]})")
+    ax.set_xlabel("|μ| (normalised)")
     ax.legend(fontsize=7)
     ax.grid(True, alpha=0.3)
 

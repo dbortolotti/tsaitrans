@@ -31,7 +31,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from model import FactorTransformer, TimeSeriesDataset, get_device
+from model import FactorTransformer, TimeSeriesDataset, get_device, normalize_horizons
 import torch
 from torch.utils.data import DataLoader
 
@@ -56,16 +56,16 @@ def load_predictions(checkpoint_dir, returns, stock_indices):
     std = float(np.load(os.path.join(checkpoint_dir, "std.npy")))
 
     context_len = config.get("context_len", 60)
-    horizon = config.get("horizon", 1)
+    horizons = normalize_horizons(config)
     probabilistic = config.get("probabilistic", False)
 
-    ds = TimeSeriesDataset(returns, stock_indices, context_len, horizon, mean, std)
+    ds = TimeSeriesDataset(returns, stock_indices, context_len, horizons=horizons, mean=mean, std=std)
     loader = DataLoader(ds, batch_size=256, shuffle=False, num_workers=0)
 
     model = FactorTransformer(
         n_stocks=1,
         context_len=context_len,
-        horizon=horizon,
+        horizons=horizons,
         d_model=config.get("d_model", 64),
         n_heads=config.get("n_heads", 4),
         n_layers=config.get("n_layers", 3),
@@ -167,24 +167,24 @@ def run_backtest(checkpoint_dir, returns, test_stocks, results_dir, half_spread=
         checkpoint_dir, returns, test_stocks
     )
 
-    horizon = config.get("horizon", 1)
+    horizons = normalize_horizons(config)
     probabilistic = config.get("probabilistic", False)
 
-    # Aggregate over horizon: sum of predicted/actual returns
-    mu_total = preds.sum(axis=1).squeeze(-1)        # (n_samples,)
-    ret_total = targets.sum(axis=1).squeeze(-1)      # (n_samples,)
+    # Use longest-horizon cumulative prediction as signal (already cumulative, no sum)
+    mu_total = preds[:, -1, 0]          # (n_samples,) — longest horizon prediction
+    ret_total = targets[:, -1, 0]       # (n_samples,) — actual return at that horizon
 
     # Half-spread in normalised units
     half_spread_norm = half_spread / (std + 1e-8)
 
     print(f"Samples: {len(mu_total)}")
-    print(f"Horizon: {horizon}")
+    print(f"Horizons: {horizons} (signal from longest: h={horizons[-1]})")
     print(f"Half-spread (raw): {half_spread}")
     print(f"Half-spread (norm): {half_spread_norm:.6f}")
     print(f"Signal std: {np.std(mu_total):.6f}")
     print(f"Signal mean: {np.mean(mu_total):.6f}")
 
-    results = {"config": {"half_spread": half_spread, "horizon": horizon,
+    results = {"config": {"half_spread": half_spread, "horizons": horizons,
                            "probabilistic": probabilistic, "test_stocks": test_stocks}}
 
     # --- Linear strategy: position = k * mu_total ---
@@ -213,8 +213,8 @@ def run_backtest(checkpoint_dir, returns, test_stocks, results_dir, half_spread=
 
     # --- Z-score strategy (probabilistic only) ---
     if probabilistic and sigmas is not None:
-        sigma_total = np.sqrt((sigmas ** 2).sum(axis=1)).squeeze(-1)
-        z = mu_total / (sigma_total + 1e-8)
+        sigma_long = sigmas[:, -1, 0]  # longest horizon sigma (no aggregation)
+        z = mu_total / (sigma_long + 1e-8)
 
         print(f"\n--- Z-Score Signal Stats ---")
         print(f"  mean |z|: {np.mean(np.abs(z)):.4f}")

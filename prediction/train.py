@@ -31,7 +31,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from model import FactorTransformer, get_device, make_splits
+from model import FactorTransformer, get_device, make_splits, normalize_horizons
 
 
 def seed_everything(seed: int):
@@ -68,13 +68,14 @@ def train(config: dict, returns: np.ndarray, stock_split: dict, save_dir: str):
     print(f"Data shape: {returns.shape}")
 
     context_len = config.get("context_len", 60)
-    horizon = config.get("horizon", 1)
+    horizons = normalize_horizons(config)
 
     # Stock-based splits
     train_ds, val_ds, test_ds, mean, std = make_splits(
-        returns, stock_split, context_len=context_len, horizon=horizon
+        returns, stock_split, context_len=context_len, horizons=horizons
     )
     print(f"Train: {len(train_ds)} | Val: {len(val_ds)} | Test: {len(test_ds)} samples")
+    print(f"Horizons: {horizons} (cumulative return targets)")
     print(f"Train stocks: {stock_split['transformer_train']}")
     print(f"Val stocks:   {stock_split['transformer_val']}")
 
@@ -91,7 +92,7 @@ def train(config: dict, returns: np.ndarray, stock_split: dict, save_dir: str):
     model = FactorTransformer(
         n_stocks=1,
         context_len=context_len,
-        horizon=horizon,
+        horizons=horizons,
         d_model=config.get("d_model", 64),
         n_heads=config.get("n_heads", 4),
         n_layers=config.get("n_layers", 3),
@@ -118,7 +119,8 @@ def train(config: dict, returns: np.ndarray, stock_split: dict, save_dir: str):
     os.makedirs(save_dir, exist_ok=True)
 
     # Save config
-    full_config = {**config, "n_stocks": 1, "probabilistic": probabilistic, "stock_split": stock_split}
+    full_config = {**config, "n_stocks": 1, "probabilistic": probabilistic,
+                   "horizons": horizons, "stock_split": stock_split}
     with open(os.path.join(save_dir, "config.json"), "w") as f:
         json.dump(full_config, f, indent=2)
 
@@ -213,7 +215,10 @@ if __name__ == "__main__":
                         help='JSON string with stock split, e.g. \'{"transformer_train":[0,1,2],"transformer_val":[3,4],"test":[9]}\'')
     parser.add_argument("--save_dir", type=str, default="checkpoints/run1")
     parser.add_argument("--context_len", type=int, default=60)
-    parser.add_argument("--horizon", type=int, default=1)
+    parser.add_argument("--horizon", type=int, default=1,
+                        help="(legacy) Dense horizon count. Use --horizons instead.")
+    parser.add_argument("--horizons", type=str, default=None,
+                        help="JSON list of sparse horizons, e.g. '[1,2,4,8,16]'")
     parser.add_argument("--d_model", type=int, default=64)
     parser.add_argument("--n_heads", type=int, default=4)
     parser.add_argument("--n_layers", type=int, default=3)
@@ -231,5 +236,8 @@ if __name__ == "__main__":
     returns = np.load(args.data)
     stock_split = json.loads(args.split)
     config = {k: v for k, v in vars(args).items() if k not in ("data", "split", "save_dir")}
+    # Parse --horizons JSON if provided
+    if config.get("horizons") is not None:
+        config["horizons"] = json.loads(config["horizons"])
 
     train(config, returns, stock_split, args.save_dir)

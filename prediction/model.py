@@ -13,6 +13,7 @@ Contains:
   - FactorTransformer   : encoder-only transformer for time series
   - get_device          : auto-selects mps / cuda / cpu
   - make_splits         : stock-based train/val/test datasets
+  - normalize_horizons  : config helper for horizon backward compat
 """
 
 import math
@@ -20,6 +21,23 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
+
+
+# ---------------------------------------------------------------------------
+# Config utility
+# ---------------------------------------------------------------------------
+
+def normalize_horizons(config: dict) -> list:
+    """Convert legacy 'horizon' int to 'horizons' list for backward compat.
+
+    If config has 'horizons' (list), return it sorted.
+    If config has 'horizon' (int), return [1, 2, ..., horizon].
+    Otherwise return [1].
+    """
+    if "horizons" in config:
+        return sorted(config["horizons"])
+    h = config.get("horizon", 1)
+    return list(range(1, h + 1))
 
 
 # ---------------------------------------------------------------------------
@@ -48,8 +66,11 @@ class TimeSeriesDataset(Dataset):
     pooled into one dataset.
 
     Each sample:
-        x : (context_len, 1)  -- input window (single stock)
-        y : (horizon, 1)      -- target (single stock)
+        x : (context_len, 1)       -- input window (single stock)
+        y : (num_horizons, 1)      -- cumulative return targets at each horizon
+
+    Targets are cumulative returns: y_h = sum(returns[t : t+h]) for each h
+    in the horizons list.
 
     Normalization uses a single scalar mean/std computed from train stocks.
     """
@@ -59,10 +80,16 @@ class TimeSeriesDataset(Dataset):
         returns: np.ndarray,        # (T, N_total)
         stock_indices: list,        # which stocks to include
         context_len: int = 60,
-        horizon: int = 1,
+        horizons: list = None,      # e.g. [1, 2, 4, 8, 16]
         mean: float = None,
         std: float = None,
     ):
+        if horizons is None:
+            horizons = [1]
+        self.horizons = sorted(horizons)
+        self.num_horizons = len(self.horizons)
+        max_horizon = max(self.horizons)
+
         data = returns[:, stock_indices]  # (T, n_split)
 
         # Compute or use provided normalization stats
@@ -77,18 +104,24 @@ class TimeSeriesDataset(Dataset):
 
         # Build sliding windows: one per stock per valid start position
         T, n_split = data_norm.shape
-        window = context_len + horizon
+        window = context_len + max_horizon
+
+        # Horizon indices for cumsum slicing (0-indexed)
+        h_indices = np.array(self.horizons) - 1
 
         self.X = []
         self.Y = []
         for s in range(n_split):
-            series = data_norm[:, s : s + 1]  # (T, 1) — keep 2D
+            series = data_norm[:, s]  # (T,)
             for t in range(T - window + 1):
-                self.X.append(series[t : t + context_len])
-                self.Y.append(series[t + context_len : t + context_len + horizon])
+                self.X.append(series[t : t + context_len].reshape(-1, 1))
+                # Cumulative returns at each horizon
+                future = series[t + context_len : t + context_len + max_horizon]
+                cum = np.cumsum(future)
+                self.Y.append(cum[h_indices].reshape(-1, 1))
 
         self.X = np.array(self.X, dtype=np.float32)  # (n_samples, context_len, 1)
-        self.Y = np.array(self.Y, dtype=np.float32)  # (n_samples, horizon, 1)
+        self.Y = np.array(self.Y, dtype=np.float32)  # (n_samples, num_horizons, 1)
 
     def __len__(self):
         return len(self.X)
@@ -101,7 +134,7 @@ def make_splits(
     returns: np.ndarray,
     stock_split: dict,
     context_len: int = 60,
-    horizon: int = 1,
+    horizons: list = None,
 ):
     """
     Create train/val/test datasets from stock-based splits.
@@ -120,9 +153,9 @@ def make_splits(
     mean = float(train_data.mean())
     std = float(train_data.std()) + 1e-8
 
-    train_ds = TimeSeriesDataset(returns, train_idx, context_len, horizon, mean, std)
-    val_ds = TimeSeriesDataset(returns, val_idx, context_len, horizon, mean, std)
-    test_ds = TimeSeriesDataset(returns, test_idx, context_len, horizon, mean, std)
+    train_ds = TimeSeriesDataset(returns, train_idx, context_len, horizons=horizons, mean=mean, std=std)
+    val_ds = TimeSeriesDataset(returns, val_idx, context_len, horizons=horizons, mean=mean, std=std)
+    test_ds = TimeSeriesDataset(returns, test_idx, context_len, horizons=horizons, mean=mean, std=std)
 
     return train_ds, val_ds, test_ds, mean, std
 
@@ -166,21 +199,26 @@ class FactorTransformer(nn.Module):
 
     Input:  (batch, context_len, 1)
     Output:
-        - deterministic: (batch, horizon, 1)
-        - probabilistic: ((batch, horizon, 1), (batch, horizon, 1))  — (mu, log_sigma)
+        - deterministic: (batch, num_horizons, 1)
+        - probabilistic: ((batch, num_horizons, 1), (batch, num_horizons, 1))  — (mu, log_sigma)
+
+    Each output slot predicts the cumulative return to the corresponding horizon.
 
     Architecture:
         1. Linear input projection: 1 -> d_model
         2. Sinusoidal positional encoding
         3. N x TransformerEncoderLayer (self-attention + FFN + LayerNorm)
-        4. Output head(s): d_model -> horizon (+ uncertainty head if probabilistic)
+        4. Output head(s): d_model -> num_horizons (+ uncertainty head if probabilistic)
     """
+
+    # TODO: Add optional EOD prediction head (mu_eod, log_var_eod)
+    #       Target: y_eod = mid[close] - mid[t], requires time_to_close as input feature.
 
     def __init__(
         self,
         n_stocks: int = 1,         # kept for API compat, should be 1
         context_len: int = 60,
-        horizon: int = 1,
+        horizons: list = None,     # e.g. [1, 2, 4, 8, 16]
         d_model: int = 64,
         n_heads: int = 4,
         n_layers: int = 3,
@@ -191,7 +229,8 @@ class FactorTransformer(nn.Module):
         super().__init__()
         self.n_stocks = n_stocks
         self.context_len = context_len
-        self.horizon = horizon
+        self.horizons = sorted(horizons) if horizons is not None else [1]
+        self.num_horizons = len(self.horizons)
         self.d_model = d_model
         self.probabilistic = probabilistic
 
@@ -214,12 +253,12 @@ class FactorTransformer(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers, enable_nested_tensor=False)
 
-        # 4. Output head: mean prediction
-        self.output_head = nn.Linear(d_model, n_stocks * horizon)
+        # 4. Output head: mean prediction (one per horizon)
+        self.output_head = nn.Linear(d_model, n_stocks * self.num_horizons)
 
         # 5. Uncertainty head (probabilistic mode only)
         if probabilistic:
-            self.log_sigma_head = nn.Linear(d_model, n_stocks * horizon)
+            self.log_sigma_head = nn.Linear(d_model, n_stocks * self.num_horizons)
 
         self._init_weights()
 
@@ -239,20 +278,20 @@ class FactorTransformer(nn.Module):
         x: (batch, context_len, n_stocks)
 
         Returns:
-            deterministic: (batch, horizon, n_stocks)
-            probabilistic: tuple of (mu, log_sigma), each (batch, horizon, n_stocks)
+            deterministic: (batch, num_horizons, n_stocks)
+            probabilistic: tuple of (mu, log_sigma), each (batch, num_horizons, n_stocks)
         """
         x = self.input_proj(x)  # (batch, context_len, d_model)
         x = self.pos_enc(x)
         x = self.encoder(x)  # (batch, context_len, d_model)
         x = x[:, -1, :]  # (batch, d_model)
 
-        mu = self.output_head(x)  # (batch, n_stocks * horizon)
-        mu = mu.view(-1, self.horizon, self.n_stocks)
+        mu = self.output_head(x)  # (batch, n_stocks * num_horizons)
+        mu = mu.view(-1, self.num_horizons, self.n_stocks)
 
         if self.probabilistic:
             log_sigma = self.log_sigma_head(x)
-            log_sigma = log_sigma.view(-1, self.horizon, self.n_stocks)
+            log_sigma = log_sigma.view(-1, self.num_horizons, self.n_stocks)
             # Clamp for numerical stability
             log_sigma = torch.clamp(log_sigma, -4.0, 2.0)
             return mu, log_sigma

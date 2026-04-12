@@ -10,8 +10,10 @@ in multiples of half_spread. Fills happen via two mechanisms:
 
 See MARKET_ENV.md for full fill mechanics and RL_DESIGN.md for reward/obs design.
 
-Observation space (4D):
-    [predicted_move, position_risk, time_remaining, cumulative_pnl]
+Observation space (3 + 2*H dimensional):
+    [position_risk, time_remaining, cumulative_pnl,
+     mu_1, ..., mu_H,           -- per-horizon predicted cumulative returns
+     sigma_1, ..., sigma_H]     -- per-horizon uncertainty
 
 Action space (2D continuous):
     [width, skew] in [-1, 1], rescaled to [0, max_width] and [-max_skew, max_skew]
@@ -33,25 +35,29 @@ class MarketMakingEnv(gym.Env):
 
     def __init__(
         self,
-        returns: np.ndarray,          # (T,) single-stock return series
-        predictions: np.ndarray,      # (T,) predicted returns from transformer
-        half_spread: float = 0.001,   # fixed market half-spread
-        target_vol: float = 0.02,     # known DGP daily vol (normalization constant)
-        r_squared: float = 0.01,      # transformer R² (measured, not tuned)
-        n_sigma: float = 1.0,         # risk tolerance in sigmas (tuning knob)
-        tau: int = 20,                # penalty floor in steps (prevents blow-up near EOD)
-        lambda2: float = 1.5,         # EOD liquidation impact multiplier (>= 1)
-        max_width: float = 3.0,       # max quote width in half_spread multiples
-        max_skew: float = 3.0,        # max quote skew in half_spread multiples
+        returns: np.ndarray,              # (T,) single-stock return series
+        mu_predictions: np.ndarray,       # (T, H) predicted cumulative returns per horizon
+        sigma_predictions: np.ndarray,    # (T, H) uncertainty per horizon
+        half_spread: float = 0.001,       # fixed market half-spread
+        target_vol: float = 0.02,         # known DGP daily vol (normalization constant)
+        r_squared: float = 0.01,          # transformer R² (measured, not tuned)
+        n_sigma: float = 1.0,             # risk tolerance in sigmas (tuning knob)
+        tau: int = 20,                    # penalty floor in steps (prevents blow-up near EOD)
+        lambda2: float = 1.5,             # EOD liquidation impact multiplier (>= 1)
+        max_width: float = 3.0,           # max quote width in half_spread multiples
+        max_skew: float = 3.0,            # max quote skew in half_spread multiples
         initial_price: float = 100.0,
     ):
         super().__init__()
 
-        assert len(returns) == len(predictions), "returns and predictions must be same length"
+        assert len(returns) == len(mu_predictions), "returns and mu_predictions must be same length"
+        assert mu_predictions.shape == sigma_predictions.shape, "mu and sigma shape mismatch"
 
         self.returns = returns.astype(np.float64)
-        self.predictions = predictions.astype(np.float64)
+        self.mu_predictions = mu_predictions.astype(np.float64)
+        self.sigma_predictions = sigma_predictions.astype(np.float64)
         self.T = len(returns)
+        self.H = mu_predictions.shape[1]  # number of horizons
 
         # Market microstructure
         self.half_spread = half_spread
@@ -68,9 +74,10 @@ class MarketMakingEnv(gym.Env):
         self.max_skew = max_skew
         self.initial_price = initial_price
 
-        # Spaces
+        # Spaces: 3 core + H mu + H sigma
+        obs_dim = 3 + 2 * self.H
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(4,), dtype=np.float64
+            low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float64
         )
         # Action: [width_raw, skew_raw] in [-1, 1], rescaled internally
         self.action_space = spaces.Box(
@@ -109,12 +116,21 @@ class MarketMakingEnv(gym.Env):
 
     def _get_obs(self):
         price = self.scaled_prices[self.t]
-        pred = self.predictions[self.t] if self.t < self.T else 0.0
-        predicted_move = pred * price                            # dollars (scaled)
         position_risk = self.position * self.target_vol * price  # dollars (scaled)
         time_remaining = (self.T - self.t) / self.T              # [0, 1]
-        return np.array([predicted_move, position_risk, time_remaining,
-                         self.cumulative_pnl], dtype=np.float64)
+
+        if self.t < self.T:
+            mu = self.mu_predictions[self.t]       # (H,)
+            sigma = self.sigma_predictions[self.t]  # (H,)
+        else:
+            mu = np.zeros(self.H)
+            sigma = np.ones(self.H)
+
+        return np.concatenate([
+            [position_risk, time_remaining, self.cumulative_pnl],
+            mu,
+            sigma,
+        ]).astype(np.float64)
 
     def _rescale_action(self, action):
         """Map [-1, 1] -> width in [0, max_width], skew in [-max_skew, max_skew]."""
@@ -237,14 +253,15 @@ class VectorizedMarketEnv:
     Compatible with a manual training loop (not gymnasium's VecEnv API).
     """
 
-    def __init__(self, returns_list, predictions_list, **kwargs):
+    def __init__(self, returns_list, mu_list, sigma_list, **kwargs):
         """
         returns_list: list of (T,) arrays, one per env
-        predictions_list: list of (T,) arrays
+        mu_list: list of (T, H) arrays — per-horizon mu predictions
+        sigma_list: list of (T, H) arrays — per-horizon sigma predictions
         """
         self.envs = [
-            MarketMakingEnv(r, p, **kwargs)
-            for r, p in zip(returns_list, predictions_list)
+            MarketMakingEnv(r, mu, sigma, **kwargs)
+            for r, mu, sigma in zip(returns_list, mu_list, sigma_list)
         ]
         self.n_envs = len(self.envs)
 

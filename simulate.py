@@ -74,7 +74,7 @@ def main(experiment_dir: str, seed: int = None, deterministic: bool = False):
     returns_normed = (returns_raw - norm_mean) / norm_std
 
     # --- Load transformer and generate predictions ---
-    from model import FactorTransformer
+    from model import FactorTransformer, normalize_horizons
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
@@ -83,12 +83,13 @@ def main(experiment_dir: str, seed: int = None, deterministic: bool = False):
 
     context_len = tf_config.get("context_len", 60)
     probabilistic = tf_config.get("probabilistic", False)
-    horizon = tf_config.get("horizon", 1)
+    horizons = normalize_horizons(tf_config)
+    H = len(horizons)
 
     model = FactorTransformer(
         n_stocks=1,
         context_len=context_len,
-        horizon=horizon,
+        horizons=horizons,
         d_model=tf_config.get("d_model", 64),
         n_heads=tf_config.get("n_heads", 4),
         n_layers=tf_config.get("n_layers", 3),
@@ -105,10 +106,9 @@ def main(experiment_dir: str, seed: int = None, deterministic: bool = False):
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
-    # Generate predictions in normalized space
-    # For probabilistic models: z-score = mu_total / sigma_total
-    # For deterministic models: sum of horizon predictions
-    predictions = np.zeros(T, dtype=np.float32)
+    # Generate per-horizon predictions (no aggregation)
+    mu_predictions = np.zeros((T, H), dtype=np.float32)
+    sigma_predictions = np.ones((T, H), dtype=np.float32)
     normed_series = (returns_raw - norm_mean) / norm_std
 
     with torch.no_grad():
@@ -117,22 +117,22 @@ def main(experiment_dir: str, seed: int = None, deterministic: bool = False):
             x = torch.tensor(window, dtype=torch.float32, device=device)
             if probabilistic:
                 mu, log_sigma = model(x)
-                mu_total = mu[0, :, 0].sum().item()
-                sigma_total = torch.exp(log_sigma[0, :, 0]).pow(2).sum().sqrt().item()
-                predictions[t] = mu_total / (sigma_total + 1e-8)
+                mu_predictions[t, :] = mu[0, :, 0].cpu().numpy()
+                sigma_predictions[t, :] = torch.exp(log_sigma[0, :, 0]).cpu().numpy()
             else:
                 pred = model(x)
-                predictions[t] = pred[0, :, 0].sum().item()
+                mu_predictions[t, :] = pred[0, :, 0].cpu().numpy()
 
-    mode = "z-score" if probabilistic else "deterministic"
-    print(f"[INFO] Transformer predictions generated [{mode}, H={horizon}]")
+    mode = "probabilistic" if probabilistic else "deterministic"
+    print(f"[INFO] Transformer predictions generated [{mode}, horizons={horizons}]")
 
     # --- Load RL policy ---
     from policy import ActorCritic
 
+    obs_dim = 3 + 2 * H
     rl_dir = os.path.join(experiment_dir, "checkpoints_rl")
     policy = ActorCritic(
-        obs_dim=4, act_dim=2, hidden=64,
+        obs_dim=obs_dim, act_dim=2, hidden=64,
         log_std_init=rl_cfg.get("log_std_init", -0.5),
         log_std_min=rl_cfg.get("log_std_min", -3.0),
         log_std_max=rl_cfg.get("log_std_max", 1.0),
@@ -148,8 +148,8 @@ def main(experiment_dir: str, seed: int = None, deterministic: bool = False):
     print(f"[INFO] Loaded policy from {policy_path}")
 
     # Load observation normalizer (if available — older checkpoints won't have it)
-    obs_mean = np.zeros(4, dtype=np.float64)
-    obs_var = np.ones(4, dtype=np.float64)
+    obs_mean = np.zeros(obs_dim, dtype=np.float64)
+    obs_var = np.ones(obs_dim, dtype=np.float64)
     if os.path.exists(norm_path):
         norm_data = np.load(norm_path)
         obs_mean = norm_data["obs_mean"]
@@ -162,7 +162,8 @@ def main(experiment_dir: str, seed: int = None, deterministic: bool = False):
 
     env = MarketMakingEnv(
         returns=returns_raw,
-        predictions=predictions,
+        mu_predictions=mu_predictions,
+        sigma_predictions=sigma_predictions,
         half_spread=rl_cfg.get("half_spread", 0.001),
         target_vol=data_cfg.get("target_vol", 0.02),
         r_squared=rl_cfg.get("r_squared", 0.01),

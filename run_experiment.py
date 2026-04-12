@@ -44,7 +44,7 @@ DEFAULTS = {
     },
     "transformer": {
         "context_len": 200,
-        "horizon": 10,
+        "horizons": [1, 2, 4, 8, 16],
         "d_model": 64,
         "n_heads": 4,
         "n_layers": 3,
@@ -133,10 +133,13 @@ def main(config_path: str, skip_data: bool = False, skip_transformer: bool = Fal
     output_dir = os.path.join("output", name)
 
     if os.path.exists(output_dir):
-        ans = input(f"Output folder '{output_dir}' already exists. Proceed and overwrite? [Y/n] ").strip().lower()
-        if ans == "n":
-            print("Aborting.")
-            sys.exit(0)
+        if sys.stdin.isatty():
+            ans = input(f"Output folder '{output_dir}' already exists. Proceed and overwrite? [Y/n] ").strip().lower()
+            if ans == "n":
+                print("Aborting.")
+                sys.exit(0)
+        else:
+            print(f"Output folder '{output_dir}' already exists. Proceeding (non-interactive).")
 
     os.makedirs(output_dir, exist_ok=True)
 
