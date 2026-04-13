@@ -1,114 +1,107 @@
-# RL Diagnosis: Why PPO Fails to Match the Linear Baseline
+# Phase 1 RL Diagnosis
 
-## The Core Problem: PPO Can't See the Reward
+## Summary
 
-**RewStd stays at 0.01 throughout the entire training run across all three experiments.** This is the smoking gun. The `RunningMeanStd` for reward normalization has initialized and then the actual reward magnitudes are so tiny that the normalizer's running std never budges from its initial state.
+PPO learns the right direction (action-signal correlation reaches 0.75-0.80) but fails to convert this into reward because three interlocking problems suppress the gradient signal and kill exploration before the policy can learn sizing.
 
-## The Arithmetic of the Reward Signal
+Baseline reward: 4.0 per episode. PPO best: 0.0014 per step (~2.8 total). PPO never matches the trivial linear baseline.
 
-In `SignalExposureEnv`, the reward is:
+---
 
-    reward = reward_scale * position * target_return - alpha_pos * position² - beta_trade * Δposition²
+## Problem 1: Reward Scale Is Too Small (THE KILLER)
 
-With `reward_scale=10`, `max_position=1.0`, and typical returns at std ≈ 0.0002 (normalization std), a single-step return is ~O(0.0002). Even over a 16-step horizon, target_return ≈ O(0.0002 × 4) ≈ O(0.0008). So the signal term per step is:
+### Evidence
 
-    10 * 1.0 * 0.0008 = 0.008
+- RewStd column reads 0.01 across all 300 iterations of Experiments B and C
+- MeanRew hovers between -0.005 and +0.002 — noise-floor territory
+- Baseline achieves 4.0 per episode; PPO never exceeds ~0.002 per step
 
-The penalty terms are:
+### Root cause
 
-    alpha_pos * 1² = 0.01
-    beta_trade * 1² = 0.005
+Returns have std ~ 0.0002. A target return over 16 steps is roughly 0.0002 * sqrt(16) ~ 0.0008. With reward_scale = 10.0 and position ~0.3:
 
-**The penalty terms are the same order as or larger than the maximum possible signal reward.** The optimal policy from PPO's perspective is to minimize the quadratic penalties, which means: do nothing. And that's exactly what it learns.
+    signal_reward ~ 10 * 0.3 * 0.0008 = 0.0024 per step
+    penalty       ~ 0.01 * 0.09       = 0.0009 per step
+    net reward    ~ 0.001 per step
 
-## What the Logs Confirm
+This is the same order of magnitude as noise. PPO cannot extract a useful gradient from rewards this small.
 
-### Experiment A (full_market_making, 300 iters)
+Additionally, in train_rl.py line 493:
 
-- Position collapses from 0.32 → 0.005 by iter 80
-- Entropy stays high (~1.0) — agent never commits to a strategy
-- Reward goes from -85 → ~-0.03
-- "Success" = doing nothing
+    rewards_norm = rewards / reward_rms.std
 
-### Experiment B (signal_exposure, 300 iters) — Most Revealing
+The RunningMeanStd converges to a tiny denominator, creating an extra layer of unstable normalization on top of already-tiny rewards.
 
-- Entropy drops steadily from 0.89 → -1.58 (saturates at log_std_min = -3.0)
-- Correlation rises nicely: 0.00 → 0.80
-- But |Pos| is only ~0.22 and |Act| ~0.22
-- **Mean reward plateaus at 0.001 vs baseline of 1.31**
+### Fix
 
-The policy *learns the direction* (correlation 0.8 is excellent!) but the reward normalization crushes the actual magnitude. The reward_rms.std stays at 0.01 because the normalized rewards create a feedback loop: tiny raw rewards → tiny updates to RMS → perpetually tiny std.
+Increase reward_scale to 1000-10000 (not 10). The reward needs to be O(1) per step for PPO to have a clear gradient. Alternatively, normalize returns inside the environment before applying reward_scale. Consider turning off reward normalization entirely for Phase 1, or using a much longer warm-up for the reward RMS — the reward_scale already handles scaling, the extra normalization adds instability and lag.
 
-### Experiment C (signal_exposure, 50 iters)
+---
 
-- Same pattern, shorter run
-- Baseline is 4.0, PPO gets 0.0014
+## Problem 2: Entropy Collapse Kills Exploration
 
-## Why the Baseline Crushes PPO
+### Evidence
 
-The linear baseline does `position = clip(k * z_h, -1, 1)` and gets reward ~1.3–4.0. It uses the raw z-score directly, taking large positions when the signal is strong. PPO can't do this because:
+- Entropy drops monotonically from ~0.9 to deeply negative values (-1.58 in Exp B)
+- log_std hits the floor at log_std_min = -3.0 (std ~ 0.05) and stays clamped
+- LOW-ENT warnings start at iteration ~35, before the policy has learned anything useful
+- By iteration 100+, the policy is nearly deterministic with |action| ~ 0.2
 
-1. **The reward is too small relative to the penalties** — at reward_scale=10 and returns O(0.0002), the directional edge per step barely exceeds alpha_pos.
-2. **The reward normalization (rewards / reward_rms.std) doesn't help** — it would help if reward scale were the issue, but the fundamental problem is that the signal-to-penalty ratio is <1. Normalizing doesn't change ratios.
-3. **Entropy collapse confirms premature convergence** — LogStd hits -3.0 (the floor) while the policy is still suboptimal. The agent has become deterministic too early, locking in a mediocre strategy.
+### Root cause
 
-## Root Causes (Ranked by Severity)
+ent_coef starts at 5e-4 and anneals toward 1e-5. This is far too weak. The entropy bonus is fighting against a gradient that consistently rewards reducing variance — because rewards are tiny and noisy, the safest thing PPO can do is reduce exploration. The policy becomes deterministic before it learns how much to bet.
 
-### 1. Unit Mismatch Between Observations and Rewards (PRIMARY)
+### Fix
 
-`SignalExposureEnv._target_return()` sums **raw returns** (O(0.0002)), but `mu_predictions` comes from the transformer trained on `(returns - mean) / std` with `std=0.0002`. The mu values are O(1) in normalized space.
+Increase ent_coef to 0.01-0.05 and do not anneal it during Phase 1. Set log_std_min = -1.0 (std ~ 0.37) to prevent premature collapse. You are trying to learn a basic directional mapping — you need sustained exploration, not convergence to a point estimate.
 
-**The observation and reward operate in completely different scales.**
+---
 
-The agent sees signals of O(0.3–0.8) in the obs but gets rewarded on realized returns of O(0.0008). This is why:
-- Correlation is high (it learns direction from large-scale obs)
-- Reward is negligible (the actual payoff is in a different unit)
+## Problem 3: Value Function Never Learns
 
-`reward_scale=10` doesn't come close to bridging this gap. You'd need `reward_scale ≈ 10 / std ≈ 50,000` to make the signal term comparable to what the baseline sees.
+### Evidence
 
-### 2. Penalty Parameters Calibrated for Wrong Scale
+- VLoss stays between 0.6 and 1.0 across all 300 iterations — essentially random prediction
+- The critic never learns to predict returns
 
-`alpha_pos=0.01` and `beta_trade=0.005` are set as if the signal term produces O(1) rewards, but it produces O(0.001). These need to be proportional to `reward_scale * return_scale`.
+### Root cause
 
-### 3. gamma=0.99 with T=2000 Steps Is Borderline
+Partly caused by Problem 1 (tiny rewards mean the target values are noise-dominated). Partly caused by the return normalization in ppo_update:
 
-The effective horizon is 1/(1-gamma) = 100 steps, so rewards beyond ~100 steps are heavily discounted. target_horizon is 16 so this isn't catastrophic, but the cumulative_reward term in the obs could become very large and noisy.
+    returns_norm = (returns - ret_mean) / ret_std
 
-### 4. Entropy Annealing Too Fast
+When rewards are ~1e-3, the GAE returns are also tiny, and normalizing them to zero-mean unit-variance inflates noise to the same scale as signal. The critic is fitting noise.
 
-Annealing from 5e-4 to 1e-5 combined with log_std_min=-3.0 causes LogStd to hit the floor by iter ~70. Once hit, the policy is nearly deterministic and can't explore better strategies.
+### Fix
 
-## Recommended Fixes
+Fixing Problem 1 (larger reward_scale) should largely resolve this. The critic needs a signal-to-noise ratio above 1 to learn anything meaningful.
 
-### Fix 1: Normalize target_return (Critical)
+---
 
-Make `_target_return` use normalized returns so the reward lives in the same space as the predictions:
+## Secondary Issue: Low Environment Diversity
 
-    def _target_return(self, t):
-        end = min(t + self.target_horizon, self.T)
-        if end <= t:
-            return 0.0
-        return float(((self.returns[t:end] - self.norm_mean) / self.norm_std).sum())
+n_envs = 4 with rollout_steps = 2048 gives 8192 samples per iteration. But each env runs a full 2000-step episode, so you only see 4 stock paths per iteration out of 20 available. Gradient estimates are noisy due to low path diversity.
 
-Pass `norm_mean` and `norm_std` into the env constructor.
+Consider n_envs = 8-16 for better gradient estimates per iteration.
 
-### Fix 2: Recalibrate Penalties
+---
 
-With normalized returns at O(1), the signal term becomes `reward_scale * position * O(4)` ≈ 40. Set penalties proportionally:
+## What the Logs Actually Show
 
-    alpha_pos  = 1.0   (was 0.01)
-    beta_trade = 0.5   (was 0.005)
+The policy IS learning something — the Corr column reaches 0.75-0.80, meaning actions track the signal direction well. But the reward scale is so tiny relative to noise that PPO cannot convert directional correctness into reward improvement.
 
-### Fix 3: Slower Entropy Schedule
+The baseline takes position = clip(z_h) which gives it ~0.33 average position. PPO's positions are stuck at ~0.2 with collapsed entropy. The policy knows WHERE to go but has not learned HOW MUCH to bet, and it cannot explore that dimension because entropy is dead.
 
-    log_std_min = -2.0   (was -3.0)
-    ent_coef    = 1e-3   (was 5e-4)
-    ent_coef_end = 1e-4  (was 1e-5)
+---
 
-### Fix 4: Lower gamma (Optional)
+## Recommended Action Plan
 
-    gamma = 0.97  (was 0.99, matches experiment4 base config anyway)
+All three fixes should be applied together — they interact:
 
-## Confidence Level
+1. Set reward_scale = 3000-5000 (calibrate so per-step reward is O(1))
+2. Set ent_coef = 0.02, do not anneal, set log_std_min = -1.0
+3. Disable reward normalization (set rewards_norm = rewards) or use a fixed normalizer
+4. Increase n_envs to 8-16
+5. Re-run Experiment B and compare MeanRew trajectory against baseline
 
-~90% confident the unit mismatch between obs and reward (issue #1) is the primary failure mode. The other issues (entropy schedule, gamma) are secondary but real. The log patterns — high correlation, near-zero reward, RewStd frozen at 0.01 — are exactly what you'd see when the policy learns the direction from correctly-scaled features but gets near-zero payoff from incorrectly-scaled returns.
+Success criteria remain the same as the action plan: PPO should match or beat the baseline reward of ~4.0 per episode, with mean absolute position comparable to baseline (~0.33) and sustained positive correlation with the signal.
