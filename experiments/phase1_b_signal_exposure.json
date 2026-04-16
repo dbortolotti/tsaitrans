@@ -1,5 +1,5 @@
 {
-  "base_experiment": "experiment4",
+  "base_experiment": "experiment5",
   "rl": {
     "predictor": "transformer",
     "reward_mode": "signal_exposure",

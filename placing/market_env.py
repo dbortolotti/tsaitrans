@@ -272,6 +272,10 @@ class SignalExposureEnv(gym.Env):
         alpha_pos: float = 0.01,
         beta_trade: float = 0.005,
         max_position: float = 1.0,
+        ablate_penalties: bool = False,
+        reward_mode: str = "signal_exposure",
+        reward_horizon: int = 8,
+        action_space_type: str = "continuous",
         **kwargs,                         # absorb unused market-making params
     ):
         super().__init__()
@@ -284,9 +288,18 @@ class SignalExposureEnv(gym.Env):
 
         self.target_horizon = target_horizon
         self.reward_scale = reward_scale
-        self.alpha_pos = alpha_pos
-        self.beta_trade = beta_trade
         self.max_position = max_position
+        self.reward_mode = reward_mode
+        self.reward_horizon = reward_horizon
+        self.action_space_type = action_space_type
+
+        # Penalty ablation: zero out penalties when flag is set
+        if ablate_penalties:
+            self.alpha_pos = 0.0
+            self.beta_trade = 0.0
+        else:
+            self.alpha_pos = alpha_pos
+            self.beta_trade = beta_trade
 
         # Precompute cumulative prices for target return calculation
         self.cum_returns = np.cumsum(self.returns)  # cumulative sum of returns
@@ -297,10 +310,14 @@ class SignalExposureEnv(gym.Env):
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float64
         )
-        # 1D action: target position in [-1, 1], scaled to [-max_position, max_position]
-        self.action_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(1,), dtype=np.float64
-        )
+
+        # Action space: continuous (1D) or discrete3 ({-1, 0, +1})
+        if action_space_type == "discrete3":
+            self.action_space = spaces.Discrete(3)
+        else:
+            self.action_space = spaces.Box(
+                low=-1.0, high=1.0, shape=(1,), dtype=np.float64
+            )
 
         self.reset()
 
@@ -347,25 +364,41 @@ class SignalExposureEnv(gym.Env):
             return self._get_obs(), 0.0, True, False, {}
 
         # Map action to target position
-        new_position = float(np.clip(action[0], -1.0, 1.0)) * self.max_position
+        if self.action_space_type == "discrete3":
+            # action is int in {0, 1, 2} -> position in {-1, 0, +1} * max_position
+            new_position = float(action - 1) * self.max_position
+        else:
+            new_position = float(np.clip(action[0], -1.0, 1.0)) * self.max_position
         prev_position = self.position
 
-        # Target return (realized future return over horizon)
-        target_ret = self._target_return(self.t)
-
-        # Phase 1 reward
-        reward = (
-            self.reward_scale * new_position * target_ret
-            - self.alpha_pos * new_position ** 2
-            - self.beta_trade * (new_position - prev_position) ** 2
-        )
+        # Reward computation depends on reward_mode
+        if self.reward_mode == "horizon_aligned":
+            # Horizon-aligned reward: position * future return over reward_horizon
+            end = min(self.t + self.reward_horizon, self.T)
+            if end <= self.t:
+                target_ret = 0.0
+            else:
+                target_ret = float(self.returns[self.t:end].sum())
+            reward = (
+                self.reward_scale * new_position * target_ret
+                - self.alpha_pos * new_position ** 2
+                - self.beta_trade * (new_position - prev_position) ** 2
+            )
+        else:
+            # Default signal_exposure reward
+            target_ret = self._target_return(self.t)
+            reward = (
+                self.reward_scale * new_position * target_ret
+                - self.alpha_pos * new_position ** 2
+                - self.beta_trade * (new_position - prev_position) ** 2
+            )
 
         self.position = new_position
         self.cumulative_reward += reward
 
         # Logging
         self.log["positions"].append(new_position)
-        self.log["actions"].append(float(action[0]))
+        self.log["actions"].append(float(action - 1) if self.action_space_type == "discrete3" else float(action[0]))
         self.log["rewards"].append(reward)
         self.log["target_returns"].append(target_ret)
         self.log["turnover"].append(abs(new_position - prev_position))
@@ -388,16 +421,21 @@ class VectorizedSignalExposureEnv:
             for r, mu, sigma in zip(returns_list, mu_list, sigma_list)
         ]
         self.n_envs = len(self.envs)
+        self.action_space_type = kwargs.get("action_space_type", "continuous")
 
     def reset(self):
         obs = np.stack([env.reset()[0] for env in self.envs])
         return obs
 
     def step(self, actions):
-        """actions: (n_envs, 1)"""
+        """actions: (n_envs, 1) for continuous or (n_envs,) int for discrete3"""
         obs_list, rew_list, done_list = [], [], []
         for i, env in enumerate(self.envs):
-            obs, rew, term, trunc, info = env.step(actions[i])
+            if self.action_space_type == "discrete3":
+                act = int(actions[i])
+            else:
+                act = actions[i]
+            obs, rew, term, trunc, info = env.step(act)
             done = term or trunc
             if done:
                 obs, _ = env.reset()

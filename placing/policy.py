@@ -8,7 +8,7 @@ Designed to be lightweight enough for MPS on a Mac Mini M3/M4.
 import torch
 import torch.nn as nn
 import numpy as np
-from torch.distributions import Normal
+from torch.distributions import Normal, Categorical
 
 
 class ActorCritic(nn.Module):
@@ -63,6 +63,9 @@ class ActorCritic(nn.Module):
         """For inference / rollout. Returns numpy arrays."""
         with torch.no_grad():
             mean, std, value = self.forward(obs)
+            # Guard against NaN from gradient explosion
+            if torch.isnan(mean).any() or torch.isinf(mean).any():
+                mean = torch.nan_to_num(mean, nan=0.0, posinf=5.0, neginf=-5.0)
             if deterministic:
                 action = torch.tanh(mean)
                 log_prob = torch.zeros(mean.shape[0], device=mean.device)
@@ -77,6 +80,9 @@ class ActorCritic(nn.Module):
     def evaluate(self, obs, actions):
         """For PPO update. Returns log_prob, entropy, value."""
         mean, std, value = self.forward(obs)
+        # Guard against NaN from gradient explosion — clamp mean to finite range
+        if torch.isnan(mean).any() or torch.isinf(mean).any():
+            mean = torch.nan_to_num(mean, nan=0.0, posinf=5.0, neginf=-5.0)
         # Invert tanh to recover pre-squash z
         actions_c = actions.clamp(-0.999, 0.999)
         z = torch.atanh(actions_c)
@@ -91,6 +97,70 @@ class ActorCritic(nn.Module):
 
     def critic_params(self):
         """Critic parameters (critic head only)."""
+        return list(self.critic.parameters())
+
+
+class CategoricalActorCritic(nn.Module):
+    """ActorCritic with discrete action space {-1, 0, +1} for Phase 1 Exp 4."""
+
+    def __init__(self, obs_dim=4, n_actions=3, hidden=64):
+        super().__init__()
+
+        self.n_actions = n_actions
+
+        self.trunk = nn.Sequential(
+            nn.Linear(obs_dim, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, hidden),
+            nn.Tanh(),
+        )
+
+        self.actor_logits = nn.Linear(hidden, n_actions)
+        self.critic = nn.Linear(hidden, 1)
+
+        # For compatibility with log_std logging
+        self.actor_log_std = nn.Parameter(torch.zeros(1), requires_grad=False)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.trunk:
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+                nn.init.zeros_(m.bias)
+        nn.init.orthogonal_(self.actor_logits.weight, gain=0.01)
+        nn.init.zeros_(self.actor_logits.bias)
+        nn.init.orthogonal_(self.critic.weight, gain=1.0)
+        nn.init.zeros_(self.critic.bias)
+
+    def forward(self, obs):
+        h = self.trunk(obs)
+        logits = self.actor_logits(h)
+        value = self.critic(h).squeeze(-1)
+        return logits, value
+
+    def get_action(self, obs, deterministic=False):
+        with torch.no_grad():
+            logits, value = self.forward(obs)
+            dist = Categorical(logits=logits)
+            if deterministic:
+                action = logits.argmax(dim=-1)
+            else:
+                action = dist.sample()
+            log_prob = dist.log_prob(action)
+        return action.cpu().numpy(), log_prob.cpu().numpy(), value.cpu().numpy()
+
+    def evaluate(self, obs, actions):
+        logits, value = self.forward(obs)
+        dist = Categorical(logits=logits)
+        log_prob = dist.log_prob(actions.long().squeeze(-1))
+        entropy = dist.entropy()
+        return log_prob, entropy, value
+
+    def actor_params(self):
+        return list(self.trunk.parameters()) + list(self.actor_logits.parameters())
+
+    def critic_params(self):
         return list(self.critic.parameters())
 
 
@@ -200,7 +270,7 @@ class RolloutBuffer:
 
 
 def ppo_update(
-    policy: ActorCritic,
+    policy,
     optimizer: torch.optim.Optimizer,
     buffer: RolloutBuffer,
     device: torch.device,
@@ -211,6 +281,7 @@ def ppo_update(
     ent_coef: float = 5e-4,
     max_grad_norm: float = 0.5,
     target_kl: float = 0.02,
+    disable_reward_norm: bool = False,
 ):
     """Run PPO update on collected rollout data."""
     # Normalize advantages
@@ -237,9 +308,12 @@ def ppo_update(
             surr2 = ratio.clamp(1.0 - clip_eps, 1.0 + clip_eps) * advantages
             policy_loss = -torch.min(surr1, surr2).mean()
 
-            # Value loss (normalized targets)
-            returns_norm = (returns - ret_mean) / ret_std
-            value_loss = nn.functional.mse_loss(values, returns_norm)
+            # Value loss (optionally normalized targets)
+            if disable_reward_norm:
+                value_loss = nn.functional.mse_loss(values, returns)
+            else:
+                returns_norm = (returns - ret_mean) / ret_std
+                value_loss = nn.functional.mse_loss(values, returns_norm)
 
             # Entropy bonus
             entropy_loss = -entropy.mean()

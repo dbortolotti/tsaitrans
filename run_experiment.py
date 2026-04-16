@@ -69,11 +69,18 @@ DEFAULTS = {
         "gae_lambda": 0.95,
         "ent_coef": 5e-4,
         "ent_coef_end": 1e-5,
+        "ent_coef_anneal": True,
         "target_kl": 0.02,
         "normalize_rewards": True,
         "log_std_init": -0.5,
         "log_std_min": -3.0,
         "log_std_max": 1.0,
+        # Phase 1 experiment knobs
+        "ablate_penalties": False,
+        "disable_reward_norm": False,
+        "action_space": "continuous",
+        "use_uncertainty": False,
+        "reward_horizon": 8,
         # signal_exposure params
         "target_horizon": 16,
         "reward_scale": 10.0,
