@@ -70,6 +70,7 @@ DEFAULTS = {
         "ent_coef": 5e-4,
         "ent_coef_end": 1e-5,
         "target_kl": 0.02,
+        "normalize_rewards": True,
         "log_std_init": -0.5,
         "log_std_min": -3.0,
         "log_std_max": 1.0,

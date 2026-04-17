@@ -314,6 +314,7 @@ def train(
     ent_coef_start = config.get("ent_coef", 5e-4)
     ent_coef_end = config.get("ent_coef_end", 1e-5)
     target_kl = config.get("target_kl", 0.02)
+    normalize_rewards = config.get("normalize_rewards", True)
 
     # Signal exposure params
     target_horizon = config.get("target_horizon", 16)
@@ -357,6 +358,7 @@ def train(
     print(f"\n[INFO] === Phase 1 RL Config ===")
     print(f"[INFO] reward_mode       = {reward_mode}")
     print(f"[INFO] gamma             = {gamma}")
+    print(f"[INFO] normalize_rewards = {normalize_rewards}")
     if reward_mode == "signal_exposure":
         print(f"[INFO] target_horizon    = {target_horizon}")
         print(f"[INFO] reward_scale      = {reward_scale}")
@@ -490,7 +492,10 @@ def train(
 
             reward_rms.update(rewards)
             obs_rms.update(next_obs)
-            rewards_norm = rewards / reward_rms.std
+            if normalize_rewards:
+                rewards_norm = rewards / reward_rms.std
+            else:
+                rewards_norm = rewards
 
             buffer.add(obs_norm, actions, log_probs, rewards_norm, values, dones)
             raw_actions_buf.append(actions.copy())
