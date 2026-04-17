@@ -1,0 +1,32 @@
+{
+  "data": {
+    "target_vol": 0.02,
+    "snr": 1.0,
+    "factor_half_life": 0.005,
+    "noise_half_life_range": [0.001, 0.003],
+    "n_factors": 3,
+    "steps_per_day": 1000,
+    "n_steps": 1000,
+    "stocks_transformer_train": 16,
+    "stocks_transformer_val": 4,
+    "stocks_rl_train": 8,
+    "stocks_rl_val": 2,
+    "stocks_test": 4
+  },
+  "transformer": {
+    "context_len": 40,
+    "horizons": [1, 2, 4, 8, 16],
+    "probabilistic": true,
+    "d_model": 64,
+    "n_heads": 4,
+    "n_layers": 3,
+    "lr": 3e-4,
+    "n_epochs": 20,
+    "patience": 8,
+    "batch_size": 128
+  },
+  "rl": {
+    "predictor": "transformer",
+    "n_iterations": 1
+  }
+}

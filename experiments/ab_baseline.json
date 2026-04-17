@@ -1,0 +1,20 @@
+{
+  "base_experiment": "ab_base",
+  "rl": {
+    "predictor": "transformer",
+    "reward_mode": "signal_exposure",
+    "target_horizon": 16,
+    "reward_scale": 10.0,
+    "alpha_pos": 0.01,
+    "beta_trade": 0.005,
+    "max_position": 1.0,
+    "baseline_k": 1.0,
+    "normalize_rewards": true,
+    "ent_coef": 5e-4,
+    "ent_coef_end": 1e-5,
+    "log_std_min": -3.0,
+    "gamma": 0.99,
+    "n_iterations": 120,
+    "rollout_steps": 1024
+  }
+}
