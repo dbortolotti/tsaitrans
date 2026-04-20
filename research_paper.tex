@@ -1,0 +1,314 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{hyperref}
+\usepackage{xcolor}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  urlcolor=blue!50!black,
+  citecolor=blue!50!black
+}
+
+\title{\textbf{A Repository-Grounded Study of Two-Stage Synthetic Intraday Trading:}\\
+Latent-Factor Forecasting with a Transformer and Execution Control with PPO}
+\author{Technical synthesis of the \texttt{tsaitrans} codebase}
+\date{April 15, 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This paper reconstructs the learning system implemented in the \texttt{tsaitrans} repository from code, documentation, and saved experiment artifacts. The project couples a synthetic latent-factor market generator, a multi-horizon encoder-only transformer for return forecasting, and a reinforcement-learning execution module built around PPO. The synthetic data-generating process is fully parameterized by daily volatility, signal-to-noise ratio, and half-life controls for both common factors and idiosyncratic noise. The forecasting model is trained on stock-level splits, not time splits, so each stock is treated as an independent realization of the same stochastic law. On the strongest saved forecasting run, the transformer reaches \(R^2\) values of \(0.558\), \(0.427\), \(0.348\), \(0.221\), and \(0.104\) at horizons \(h \in \{1,2,4,8,16\}\), with directional accuracy above \(0.60\) even at \(h=16\). A simple analytical backtest on the same predicted signal is strongly profitable after costs, showing that the supervised model is economically informative in the repository's normalized test environment. The main negative result concerns control: the simplified signal-exposure PPO agent learns directional alignment but fails to approach the linear baseline reward, while the full market-making formulation remains loss-making across later grid searches even after reward and observation normalization fixes. The codebase therefore documents a precise lesson: in a controlled synthetic setting, good prediction quality and even profitable signal extraction do not imply that an execution policy trained with generic PPO will recover the available edge once fills, inventory dynamics, and horizon mismatch are introduced.
+\end{abstract}
+
+\section{Introduction}
+The repository studies a clean factorization of the trading problem:
+\[
+\text{past returns} \rightarrow \text{predictive signal} \rightarrow \text{action policy}.
+\]
+Rather than learning this end to end, \texttt{tsaitrans} freezes the decomposition into two trainable stages.
+
+The first stage is supervised. It learns a mapping from a univariate history window to a vector of future cumulative returns at multiple horizons, optionally with heteroscedastic uncertainty estimates. The second stage is control. It consumes frozen predictions and learns either directional exposure sizing or bid/ask placement through PPO.
+
+This setup is scientifically useful because the upstream stochastic process is explicit rather than implicit. The code preserves the full latent-state simulator, the forecasting model, the RL environments, design documents, and several generations of experiment logs. That makes the repository suitable for a genuine technical reconstruction instead of a speculative summary.
+
+\section{Synthetic Data-Generating Process}
+\subsection{Latent-factor model}
+The return process in \texttt{prediction/generate\_data.py} is
+\begin{align}
+x_{i,t} &= \lambda_i^\top f_t + \varepsilon_{i,t}, \\
+f_t &= A f_{t-1} + \eta_t, \qquad \eta_t \sim \mathcal{N}(0,\sigma_f^2 I), \\
+\varepsilon_{i,t} &= \rho_i \varepsilon_{i,t-1} + \sigma_i \xi_{i,t}, \qquad \xi_{i,t} \sim \mathcal{N}(0,1).
+\end{align}
+Here \(f_t \in \mathbb{R}^{K}\) are common latent factors, \(\lambda_i\) are stock-specific factor loadings, and \(\varepsilon_{i,t}\) is persistent idiosyncratic AR(1) noise. The model never observes \(f_t\), \(A\), \(\lambda_i\), or the noise decomposition.
+
+Persistence is controlled in half-life units rather than raw AR coefficients. If a factor half-life is expressed as a fraction of a trading day, then the code derives
+\[
+\rho(A) = 0.5^{1 / (h_f \cdot S)},
+\]
+where \(h_f\) is the factor half-life and \(S\) is \texttt{steps\_per\_day}. Likewise, each idiosyncratic AR coefficient is sampled from a half-life range:
+\[
+\rho_i = 0.5^{1 / (h_i \cdot S)}, \qquad h_i \in [h_{\min}, h_{\max}].
+\]
+
+\subsection{Variance targeting}
+The simulator first uses an i.i.d.\ approximation to partition per-step variance into signal and noise:
+\begin{align}
+\sigma_{\text{step}} &= \frac{\sigma_{\text{day}}}{\sqrt{S}}, \\
+\sigma_{\text{sig}} &= \sigma_{\text{step}} \sqrt{\frac{\mathrm{SNR}}{1+\mathrm{SNR}}}, \\
+\sigma_{\text{noise}} &= \frac{\sigma_{\text{step}}}{\sqrt{1+\mathrm{SNR}}}.
+\end{align}
+This only fixes the instantaneous signal/noise split. Because both the latent factors and the idiosyncratic component are autocorrelated, the realized daily volatility of cumulative returns is larger than the i.i.d.\ estimate. The implementation therefore rescales the entire simulated panel so that empirical daily volatility matches \(\sigma_{\text{day}}\). This is an important detail: it preserves SNR while forcing the generator onto a stable daily scale.
+
+\subsection{Implication for prediction difficulty}
+The repository documentation correctly distinguishes total signal fraction from one-step predictability. The relevant ceiling is not \(\mathrm{SNR}/(1+\mathrm{SNR})\), but a persistence-adjusted quantity of the form
+\[
+R^2_{\text{oracle}} \approx \mathrm{Corr}(\lambda_i^\top f_t, x_{i,t+1})^2.
+\]
+The forecasting task is therefore governed jointly by SNR and half-life. Short-lived factors can produce economically meaningful but statistically weak one-step predictability; long-lived factors can make the task easier in \(R^2\) while simultaneously encouraging trivial momentum shortcuts.
+
+\section{Forecasting Model}
+\subsection{Dataset construction}
+The forecasting stage treats each stock as an independent realization of the same law. Splits are performed across stocks rather than across time. Given a stock \(i\) and time \(t\), the input is a univariate window
+\[
+\mathbf{x}_{i,t} = [x_{i,t-L+1}, \ldots, x_{i,t}]^\top \in \mathbb{R}^{L \times 1},
+\]
+with \(L=\texttt{context\_len}\). The target for horizon \(h\) is the cumulative normalized return
+\[
+y^{(h)}_{i,t} = \sum_{k=1}^{h} \tilde{x}_{i,t+k},
+\]
+where \(\tilde{x}\) denotes scalar normalization using mean and standard deviation estimated only from transformer-training stocks.
+
+The code supports sparse horizons, and the current saved experiments use
+\[
+\mathcal{H} = \{1,2,4,8,16\}.
+\]
+
+\subsection{Architecture}
+The class \texttt{FactorTransformer} in \texttt{prediction/model.py} is an encoder-only transformer with the following composition:
+\begin{enumerate}
+\item linear input projection \(1 \rightarrow d_{\mathrm{model}}\),
+\item sinusoidal positional encoding,
+\item \(N\) pre-norm transformer encoder layers with multi-head self-attention and feed-forward blocks,
+\item final-token pooling,
+\item one linear head for means and, in probabilistic mode, a second linear head for log standard deviations.
+\end{enumerate}
+
+If \(E(\cdot)\) denotes the encoder stack and \(z_{i,t}\) is the final token representation, then
+\[
+z_{i,t} = E(\mathbf{x}_{i,t})_{L},
+\]
+and the predictive heads are
+\begin{align}
+\mu_{i,t} &= W_\mu z_{i,t} + b_\mu \in \mathbb{R}^{|\mathcal{H}|}, \\
+\log \sigma_{i,t} &= \mathrm{clip}(W_\sigma z_{i,t} + b_\sigma,\,-4,\,2).
+\end{align}
+
+This is a small model by design. The main saved configuration uses \(d_{\mathrm{model}}=64\), \(4\) heads, \(3\) encoder layers, and an FFN width of \(256\).
+
+\subsection{Training objective}
+Two losses are implemented.
+
+In deterministic mode, the objective is standard mean squared error:
+\[
+\mathcal{L}_{\mathrm{MSE}} = \frac{1}{|\mathcal{H}|} \sum_{h \in \mathcal{H}} \left(\mu^{(h)}_{i,t} - y^{(h)}_{i,t}\right)^2.
+\]
+
+In probabilistic mode, the repository uses a heteroscedastic Gaussian negative log-likelihood without additive constants:
+\[
+\mathcal{L}_{\mathrm{NLL}} =
+\frac{1}{|\mathcal{H}|} \sum_{h \in \mathcal{H}}
+\left[
+\frac{\left(y^{(h)}_{i,t} - \mu^{(h)}_{i,t}\right)^2}{\exp(2 \log \sigma^{(h)}_{i,t})}
+ 2 \log \sigma^{(h)}_{i,t}
+\right].
+\]
+
+Optimization is carried out with AdamW, cosine decay with warmup, gradient clipping, and early stopping on validation loss.
+
+\section{Forecasting Results}
+The strongest saved run is recorded in \texttt{output/experiment4/results/metrics.json}. Its resolved configuration uses:
+\begin{itemize}
+\item \(95\) stocks split into \(50\) transformer-train, \(10\) transformer-val, \(20\) RL-train, \(5\) RL-val, and \(10\) test stocks,
+\item \(2000\) timesteps per stock,
+\item \(3\) latent factors,
+\item target daily volatility \(0.02\),
+\item SNR \(=1.0\),
+\item factor half-life \(=0.005\) trading days,
+\item noise half-life range \([0.001,0.003]\),
+\item context length \(40\),
+\item probabilistic forecasting at horizons \(\{1,2,4,8,16\}\).
+\end{itemize}
+
+The saved test metrics are shown in Table~\ref{tab:forecast}.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{cccccc}
+\toprule
+Metric & \(h=1\) & \(h=2\) & \(h=4\) & \(h=8\) & \(h=16\) \\
+\midrule
+\(R^2\) & 0.558 & 0.427 & 0.348 & 0.221 & 0.104 \\
+Directional accuracy & 0.761 & 0.728 & 0.701 & 0.658 & 0.607 \\
+Mean \(|z|\) & 0.818 & 0.719 & 0.613 & 0.462 & 0.280 \\
+\bottomrule
+\end{tabular}
+\caption{Saved forecasting metrics from \texttt{output/experiment4/results/metrics.json}.}
+\label{tab:forecast}
+\end{table}
+
+Two observations matter.
+
+First, the model is genuinely predictive, not merely slightly better than zero. The shortest horizon reaches \(R^2 \approx 0.56\), which is unusually high for a noisy return-forecasting task, even in synthetic data. Second, predictive confidence falls quickly with horizon: at \(h=16\), the mean absolute z-score is only \(0.280\), and the fraction of predictions with \(|z|>1\) is only \(1.39\%\). That means the model is accurate on average but rarely highly confident on the longest horizon. This sparsity turns out to be central for the downstream RL story.
+
+\section{Analytical Monetization Before RL}
+The repository includes an explicit pre-RL validation stage in \texttt{prediction/backtest.py}. This is the right scientific move. Before blaming PPO, the code first asks whether the frozen signal is profitable under a simple cost model.
+
+Let \(\hat{r}_t\) denote the longest-horizon cumulative forecast and \(r_t\) the realized cumulative return over that same horizon. The simplest linear strategy sets
+\[
+p_t = k \hat{r}_t.
+\]
+Net PnL is
+\[
+\Pi_t = p_t r_t - c |p_t - p_{t-1}|,
+\]
+where \(c\) is the half-spread in normalized units.
+
+The saved backtest in \texttt{output/experiment4/backtest/backtest.json} is strongly positive. For example:
+\begin{itemize}
+\item linear sizing with \(k=1\) achieves total normalized PnL \(167{,}133.18\) and Sharpe \(23.35\),
+\item thresholding at \(1\sigma\) yields total PnL \(20{,}957.51\) and Sharpe \(20.34\),
+\item z-score sizing with \(k=2\) and threshold \(1.0\) yields total PnL \(26{,}240.97\) and Sharpe \(17.65\).
+\end{itemize}
+
+These magnitudes should not be interpreted as realistic market Sharpe ratios, because the environment is synthetic and normalized. But they do prove an important point: the forecasting stage already contains economically extractable structure under the repository's own transaction-cost assumptions.
+
+The bucketed conditional means are also monotone. The most negative forecast decile has mean realized return \(-6.37\), while the most positive decile has mean realized return \(+5.97\). This is exactly the signature one wants before introducing a control learner.
+
+\section{Reinforcement Learning Formulations}
+\subsection{Signal-exposure environment}
+The simplified control environment \texttt{SignalExposureEnv} learns a scalar exposure. The observation is
+\[
+o_t =
+\left[
+\frac{p_t}{p_{\max}},
+\frac{T-t}{T},
+C_t,
+\mu_t^{(1)},\ldots,\mu_t^{(H)},
+\sigma_t^{(1)},\ldots,\sigma_t^{(H)}
+\right],
+\]
+where \(p_t\) is current position, \(C_t\) is cumulative reward, and \((\mu,\sigma)\) come from the frozen transformer.
+
+With continuous actions, the policy outputs \(\tilde{a}_t \in [-1,1]\), mapped to
+\[
+p_t = p_{\max} \tilde{a}_t.
+\]
+The horizon-aligned reward used in the later phase-1 experiments is
+\[
+r_t
+=
+\alpha\, p_t \sum_{k=1}^{h_{\mathrm{rew}}} x_{t+k}
+- \beta_{\mathrm{pos}} p_t^2
+- \beta_{\mathrm{trade}} (p_t - p_{t-1})^2.
+\]
+This is a clean directional control problem: no fills, no spread microstructure, only exposure, trading cost, and horizon alignment.
+
+\subsection{Full market-making environment}
+The richer environment \texttt{MarketMakingEnv} uses a two-dimensional continuous action \((w_t,s_t)\) for width and skew, both measured in half-spread units. If \(m_t\) is the midprice and \(\delta\) the half-spread, the agent quotes
+\begin{align}
+b_t &= m_t - w_t \delta + s_t \delta, \\
+o_t &= m_t + w_t \delta + s_t \delta.
+\end{align}
+
+The environment checks both aggressive and passive fills. Aggressive fills occur if the current quote crosses the current market; passive fills occur if the next market crosses the previous resting quote. Reward is the sum of mark-to-market PnL and realized fill PnL minus a time-varying quadratic inventory term:
+\[
+r_t = \mathrm{PnL}_t - \left(\frac{n_\sigma p_t}{R^2 \sqrt{\max(T-t,\tau)}}\right)^2,
+\]
+with terminal liquidation cost
+\[
+\mathrm{EODCost} = \lambda_2 |p_T| \delta.
+\]
+
+This formulation is mathematically interpretable, but it is also much harder than the signal-exposure problem. The control target is no longer ``take the right direction''; it is ``quote in a way that obtains fills, earns spread, expresses directional alpha, and controls inventory simultaneously.''
+
+\section{PPO Implementation}
+The policy in \texttt{placing/policy.py} is intentionally small: a shared-trunk MLP with two hidden \texttt{Tanh} layers, actor and critic heads, state-independent log standard deviation in the continuous case, and generalized advantage estimation in the rollout buffer.
+
+For continuous actions, the actor samples from a Gaussian, then applies a \(\tanh\) squash:
+\[
+z_t \sim \mathcal{N}(\mu_\theta(o_t), \Sigma_\theta), \qquad
+a_t = \tanh(z_t).
+\]
+The PPO update uses the clipped surrogate
+\[
+\mathcal{L}_{\pi}
+=
+- \mathbb{E}\left[
+\min\left(
+\rho_t A_t,\;
+\mathrm{clip}(\rho_t,1-\epsilon,1+\epsilon)A_t
+\right)
+\right],
+\]
+along with value loss and entropy regularization.
+
+The later training code adds two stabilizers that matter for interpretation:
+\begin{itemize}
+\item observation normalization using running mean and variance,
+\item reward scaling by running standard deviation before value fitting.
+\end{itemize}
+These fixes appear in the current \texttt{train\_rl.py} and are also documented in \texttt{HANDOVER.md}. They address a real failure mode: raw inventory penalties can dwarf mark-to-market PnL by several orders of magnitude, making PPO value targets numerically pathological.
+
+\section{Empirical RL Outcomes}
+\subsection{Phase-1 signal exposure}
+The saved phase-1 run in \texttt{output/phase1\_b\_signal\_exposure/checkpoints\_rl} is the cleanest positive control. Its saved configuration reports a linear baseline mean episode reward of \(1.0335\). PPO, however, finishes with a last-20-iteration average reward of only \(0.0010\), despite an action-signal correlation of \(0.7692\) and mean absolute position \(0.2265\).
+
+This is an important result. The policy clearly learns the correct \emph{direction}: it aligns actions with the signal. But it does not learn the correct \emph{magnitude} well enough to monetize at the baseline level. In other words, PPO solves coarse sign selection while failing at calibrated sizing.
+
+The older reward design in \texttt{phase1\_a\_old\_reward} is even more revealing. Its last-20 average absolute position is only \(0.0067\), effectively flat, while still showing action-signal correlation \(0.336\). That is a classic collapse mode: the agent learns that the safest way to avoid badly scaled penalties is to do almost nothing.
+
+\subsection{Full market making}
+The strongest evidence against the current full market-making formulation comes from the later grid searches under \texttt{output/grid7\_*}. Among the top-performing saved settings, none has positive mean PnL across ten simulation seeds. The best saved run is
+\[
+\texttt{grid7\_ns0.5\_l210.0},
+\]
+with
+\[
+\mathrm{pnl\_mean} = -0.2922, \qquad
+\mathrm{avg\_position\_mean} = 0.2766.
+\]
+Other top runs remain negative as well, typically in the range \(-0.30\) to \(-0.54\) mean PnL.
+
+This is not a small implementation detail. The repository contains a forecasting model that is strongly predictive and an analytical signal strategy that is clearly profitable in normalized terms, yet the execution learner remains systematically unable to recover positive average performance once quote placement and fill mechanics are introduced.
+
+\section{Why Prediction Does Not Transfer Cleanly to Control}
+The codebase points to three interacting causes.
+
+First, there is a horizon mismatch. The supervised model predicts cumulative return over horizons \(\{1,2,4,8,16\}\), but the full market-making environment pays reward at the granularity of fills and one-step mark-to-market. This means the value of holding inventory is only indirectly represented.
+
+Second, the signal is statistically strong but confidence-sparse at long horizons. Because large-\(|z|\) opportunities are rare, a policy that must also pay spread, manage inventory, and choose fill-seeking quotes has to act on a weak dense signal or wait for sparse strong opportunities. PPO appears to choose mostly the former poorly or the latter not at all.
+
+Third, the inventory penalty is economically interpretable but numerically dominant. The later reward-normalization fixes help optimization, yet the saved grid results show that the underlying economic trade-off is still not well balanced for generic PPO.
+
+The net effect is a three-stage gap:
+\[
+\text{forecast quality} \not\Rightarrow \text{good sizing policy} \not\Rightarrow \text{good quote placement policy}.
+\]
+This, in my view, is the central scientific contribution of the repository.
+
+\section{Conclusion}
+The \texttt{tsaitrans} repository succeeds at the first two scientific tasks it sets for itself. It defines a transparent synthetic market with controlled latent structure, and it trains a compact transformer that extracts substantial multi-horizon predictive signal from that environment. The saved forecasting metrics and analytical backtests show that this signal is not a cosmetic artifact.
+
+The repository also produces a useful negative result. Generic PPO, even with later normalization fixes, does not reliably convert that signal into profitable execution behavior once the problem is expanded to inventory-aware market making. In the simplified signal-exposure setting, PPO learns directional alignment but not baseline-quality sizing. In the full quote-placement setting, later grid searches remain loss-making.
+
+This makes the next research step clear. The bottleneck is no longer the forecaster. It is the interface between prediction and control: horizon-consistent reward design, state variables that express remaining alpha, and policy classes that can learn calibrated position or quote schedules instead of only local reactions.
+
+\end{document}
