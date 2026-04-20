@@ -1,152 +1,163 @@
-# RL Design: Reward Function and Observation Space
+# RL Design: State and Reward
 
-## Observation Space (4D)
+This document captures the RL design choices for the simplified
+market-making environment.
 
-All prices scaled by initial price (start at 1.0). "Dollars" means scaled dollars throughout.
+`MARKET_ENV.md` describes the fill mechanics. This file describes:
 
-| # | Feature | Formula | Units |
-|---|---|---|---|
-| 1 | Predicted move | `prediction * price` | dollars |
-| 2 | Position risk | `position * target_vol * price` | dollars |
-| 3 | Time remaining | `(T - t) / T` | [0, 1] |
-| 4 | Cumulative PnL | running total | dollars |
+- the observation/state seen by the policy
+- the reward function
+- the terminal liquidation rule
+
+---
+
+## Observation Space
+
+At time `t`, the observation is:
+
+```text
+obs_t = [
+    position_norm,
+    time_remaining,
+    bid_active,
+    live_k_bid,
+    offer_active,
+    live_k_offer,
+    mu_1, ..., mu_H,
+    sigma_1, ..., sigma_H,
+]
+```
+
+### Definitions
+
+- `position_norm = position / max_position`
+- `time_remaining = (T - t) / T`
+- `bid_active in {0, 1}` indicates whether a passive bid from the previous step
+  is currently live and eligible to fill on this transition
+- `live_k_bid` is the live passive bid quote distance in half-spread units, or
+  `0` if no live bid exists
+- `offer_active in {0, 1}` indicates whether a passive offer from the previous
+  step is currently live
+- `live_k_offer` is the live passive offer quote distance in half-spread units,
+  or `0` if no live offer exists
+- `mu_h` is the transformer prediction for cumulative return to horizon `h`
+- `sigma_h` is the forecast uncertainty for horizon `h`
 
 ### Design rationale
 
-- **No rolling vol** — DGP has constant conditional variance, no vol clustering to detect. Rolling vol is noise around `target_vol`.
-- **No last return** — redundant with transformer prediction, which is trained on return history.
-- **No inventory age** — redundant given position risk + time remaining.
-- **No forward-looking normalization** — `return_scale = std(full series)` was a look-ahead bug. Use `target_vol` (known DGP parameter, analogous to historical daily vol) as the normalization constant.
-- **Position as dollar risk** not raw units — `position * target_vol * price` is directly comparable with cumulative PnL and spread costs.
+- **Inventory matters directly**: the policy needs current position to manage
+  risk and respect the hard cap.
+- **Time-to-close matters directly**: the agent should learn to flatten more as
+  the episode nears the end.
+- **Live passive orders matter directly**: passive fills at time `t` depend on
+  the orders submitted at `t-1`, so the policy needs to know what is still live.
+- **Multi-horizon forecasts stay in the state**: the transformer predicts
+  cumulative returns at multiple horizons, and the policy can decide how to use
+  short vs long horizon signals.
+- **No cumulative PnL in the state**: it is not needed for the control problem
+  and adds extra noise.
+- **No absolute price level in the state**: passive quote distances are defined
+  in half-spread units, so the problem is already scale-stable.
 
 ---
 
 ## Reward Function
 
-### Per-step reward
+Per-step reward is the economic outcome of the transition from `t` to `t+1`:
 
-```
-reward(t) = mark_to_market_pnl(t) − (n · l(t) · position(t))²
-```
-
-- **Mark-to-market PnL:** `position_before · Δmid + fill_pnl` (unrealized change on existing position + realized PnL from any fills this step).
-- **Inventory penalty:** Time-varying quadratic, calibrated from first principles (see below).
-
-### Terminal penalty (last step only)
-
-```
-terminal_cost = λ2 · |position| · half_spread
+```text
+reward_t = inventory_pnl_t + fill_pnl_t - inventory_penalty_t
 ```
 
-- Models forced EOD liquidation: cross the spread + extra impact for urgency.
-- `λ2 >= 1` — the 1x component is real spread cost, anything above captures market impact.
+with terminal liquidation cost applied on the last step:
+
+```text
+reward_terminal -= terminal_cost
+```
+
+### Inventory PnL
+
+```text
+inventory_pnl_t = position_before_t * (mid(t+1) - mid(t))
+```
+
+This is the mark-to-market change on inventory carried into the step.
+
+### Fill PnL
+
+`fill_pnl_t` is the sum of the PnL contribution from every fill in the step.
+
+Aggressive fills:
+
+```text
+aggressive buy  -> mid(t+1) - om(t)
+aggressive sell -> bm(t) - mid(t+1)
+```
+
+Passive fills:
+
+```text
+passive buy  -> mid(t+1) - bid_t
+passive sell -> offer_t - mid(t+1)
+```
+
+This means:
+
+- aggressive trading pays the spread
+- passive fills can earn spread
+- neither aggressive nor passive fills are guaranteed to be profitable after the
+  next price move
+
+### Inventory penalty
+
+```text
+inventory_penalty_t = kappa_t * position_after_t^2
+```
+
+where:
+
+```text
+kappa_t = kappa_base + kappa_close * progress(t)^2
+progress(t) = t / (T - 1)
+```
+
+This is a simple time-varying quadratic inventory cost:
+
+- **early in the episode**: inventory is penalized lightly
+- **near the close**: inventory is penalized more heavily
+
+The penalty is intentionally simple. It does not depend directly on transformer
+`R^2`; the transformer horizon structure is already available through
+`mu_1..mu_H` and `sigma_1..sigma_H` in the state.
 
 ---
 
-## Calibrating the inventory penalty
+## Terminal Liquidation
 
-### Critical position
+Any residual inventory at the final step is penalized via:
 
-At time t with position p, ask: when does a 1σ adverse move on my inventory wipe out all expected remaining PnL?
-
-- **1σ move on inventory:** `|p| · σ_step` (one-step dollar risk)
-- **Expected remaining alpha:** `R² · σ_step · sqrt(T - t)` (assuming one trade per step, each capturing R² of per-step vol)
-
-Setting them equal, `σ_step` cancels:
-
-```
-p_crit(t) = R² · sqrt(T - t)
+```text
+terminal_cost = lambda2 * abs(position_T) * half_spread
 ```
 
-This is the position at which a single 1σ move wipes out all expected future gains. Above `p_crit`, holding inventory is uncompensated risk.
+Interpretation:
 
-### Defining l(t)
+- `abs(position_T) * half_spread` models paying the spread to flatten
+- `lambda2 >= 1` can add extra urgency / liquidation cost
 
-Set `l(t)` so that `l(t) · p = 1` at the critical position:
-
-```
-l(t) = 1 / (R² · sqrt(max(T - t, τ)))
-```
-
-`l(t)` increases as the day progresses — the critical position shrinks, so the penalty tightens.
-
-**Floor `τ`:** Without it, `l(t) → ∞` as `t → T`, causing exploding penalty values that dwarf PnL signal and destabilize PPO training (exploding value function gradients, wildly varying reward scale across the episode). Clamping `T - t` to `τ` (e.g. 10–50 steps) keeps `l(t)` bounded in the final steps. The terminal penalty `λ2` handles the actual EOD flattening incentive. `τ` doesn't need careful tuning — it just prevents numerical blow-up.
-
-### The penalty
-
-```
-penalty(t) = (n · l(t) · p)² = (n · p / (R² · sqrt(T - t)))²
-```
-
-Compare the linear and quadratic forms of `n · l · p`:
-- They meet at `l(t) · p = 1/n`, i.e. at `p = p_crit / n`
-- Below: quadratic is forgiving (small positions tolerated)
-- Above: quadratic punishes harder than linear
-
-### Parameters
-
-| Parameter | Meaning | How to set |
-|---|---|---|
-| `R²` | Transformer prediction quality | Measured, not tuned |
-| `n` | Risk tolerance in sigmas | Single tuning knob. Higher n = more conservative, penalty bites at smaller positions (`p_crit / n`) |
-| `τ` | Penalty floor (steps) | 10–50. Prevents `l(t)` blow-up near EOD. Not sensitive. |
-| `λ2` | EOD liquidation impact multiplier | `>= 1`. 1 = real spread cost, higher = extra impact |
-
-`R²` is known from the trained transformer. `n` is the only free parameter controlling inventory penalty — interpretable as "how many sigmas of safety margin."
-
-### Behavior
-
-- **Early in day** (`T - t` large): `l(t)` small, penalty lenient, agent can hold larger positions — more time to capture remaining alpha.
-- **Late in day** (`T - t` small): `l(t)` large, penalty steep, agent pressured to flatten — little alpha left to justify risk.
-- **At `T - t ≤ τ`**: `l(t)` held constant at its maximum. Terminal penalty `λ2` handles the final flattening incentive.
-- **Low R²**: `p_crit` small everywhere — penalty tight all day, agent stays nearly flat (correct: no alpha to justify holding).
-- **High R²**: `p_crit` larger — agent has room to hold meaningful positions when alpha justifies it.
+This gives the policy a direct incentive to avoid carrying large inventory into
+the end of the episode.
 
 ---
 
-## Action Space (2D)
+## Summary
 
-### Parameterization: width + skew
+The policy is trained to:
 
-The network outputs two values in [-1, 1], mapped to:
+- earn spread when passive fills are attractive
+- use aggressive trades selectively
+- manage inventory through the day
+- finish close to flat
 
-- **Width** `w ∈ [0, max_width]` — symmetric distance from the skewed midpoint, in multiples of `half_spread`. Controls how tight/wide the quotes are.
-- **Skew** `s ∈ [-max_skew, max_skew]` — directional shift of both quotes, in multiples of `half_spread`. Controls which side is aggressive.
-
-Quote levels:
-
-```
-b(t) = mid(t) - w · half_spread + s · half_spread
-o(t) = mid(t) + w · half_spread + s · half_spread
-```
-
-### Width interpretation
-
-| Width | Meaning |
-|---|---|
-| > 1 | Wider than market — passive, may not fill |
-| = 1 | At market bid/offer |
-| (0, 1) | Inside the spread — tighter than market, still passive |
-| = 0 | Both quotes at mid + skew |
-
-Width is always >= 0. The agent cannot aggress both sides simultaneously.
-
-### Skew interpretation
-
-Skew shifts both quotes in the same direction. When `|skew|` is large enough, one side crosses the market (aggressive fill) while the other moves further away (unlikely to fill).
-
-Example (`half_spread = 0.02`, `mid = 100`, `w = 0.5`, `s = 1.5`):
-
-```
-b(t) = 100 - 0.5·0.02 + 1.5·0.02 = 100.02 = om(t)  → aggressive buy
-o(t) = 100 + 0.5·0.02 + 1.5·0.02 = 100.04            → passive, above market offer
-```
-
-Skew pushes both quotes up: bid crosses market offer (buys aggressively), offer moves further away (won't sell).
-
-### Design rationale
-
-- **Width >= 0** ensures the agent can't aggress both sides in the same step. Directional aggression comes from skew only.
-- **Width and skew are independent decisions**: "how aggressive am I" vs "which direction do I lean." Easier for the network to learn than independent bid/ask offsets.
-- **Units in `half_spread` multiples** — natural scale. Width = 1 means quoting at the market, directly interpretable.
-- **`max_width` and `max_skew`** are env parameters that cap how passive or directional the agent can be.
+The reward is intentionally economic and local. The transformer predictions
+inform the policy through the observation, not through a forecast-shaped reward.

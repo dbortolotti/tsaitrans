@@ -24,11 +24,12 @@ import time
 import numpy as np
 import torch
 
-from market_env import (
-    MarketMakingEnv, VectorizedMarketEnv,
-    SignalExposureEnv, VectorizedSignalExposureEnv,
-)
-from policy import ActorCritic, CategoricalActorCritic, RolloutBuffer, RunningMeanStd, ppo_update
+try:
+    from .market_env import MarketMakingEnv, VectorizedMarketEnv
+    from .policy import ActorCritic, RolloutBuffer, RunningMeanStd, ppo_update
+except ImportError:
+    from market_env import MarketMakingEnv, VectorizedMarketEnv
+    from policy import ActorCritic, RolloutBuffer, RunningMeanStd, ppo_update
 
 
 def load_transformer_predictions(returns, stock_indices, checkpoint_dir):
@@ -136,60 +137,7 @@ def momentum_predictor(returns, stock_indices, mean, std, horizons, lookback=10)
     return mu_predictions, sigma_predictions
 
 
-def evaluate_baseline(returns_list, mu_list, sigma_list, horizons, target_horizon,
-                      baseline_k=1.0, max_position=1.0, **env_kwargs):
-    """
-    Evaluate a deterministic linear baseline: position = clip(k * z_h, -max_pos, max_pos)
-    where z_h = mu_h / (sigma_h + eps) at the target horizon.
-
-    Returns dict of metrics.
-    """
-    # Find horizon index closest to target_horizon
-    h_idx = min(range(len(horizons)), key=lambda i: abs(horizons[i] - target_horizon))
-    actual_h = horizons[h_idx]
-    if actual_h != target_horizon:
-        print(f"[WARN] target_horizon={target_horizon} not in horizons={horizons}, "
-              f"using closest: {actual_h} (index {h_idx})")
-
-    all_rewards, all_positions, all_turnover = [], [], []
-
-    for ret, mu, sigma in zip(returns_list, mu_list, sigma_list):
-        env = SignalExposureEnv(ret, mu, sigma, target_horizon=target_horizon,
-                                max_position=max_position, **env_kwargs)
-        obs, _ = env.reset()
-        done = False
-        ep_rewards, ep_positions, ep_turnover = [], [], []
-
-        while not done:
-            # z-score at target horizon
-            mu_h = obs[3 + h_idx]
-            sigma_h = obs[3 + len(horizons) + h_idx]
-            z_h = mu_h / (sigma_h + 1e-8)
-            target_pos = np.clip(baseline_k * z_h, -max_position, max_position)
-            action = np.array([target_pos / max_position])  # map back to [-1, 1]
-
-            prev_pos = env.position
-            obs, rew, term, trunc, info = env.step(action)
-            done = term or trunc
-            ep_rewards.append(rew)
-            ep_positions.append(env.position)
-            ep_turnover.append(abs(env.position - prev_pos))
-
-        all_rewards.append(np.sum(ep_rewards))
-        all_positions.extend(ep_positions)
-        all_turnover.extend(ep_turnover)
-
-    metrics = {
-        "mean_episode_reward": float(np.mean(all_rewards)),
-        "std_episode_reward": float(np.std(all_rewards)),
-        "mean_abs_position": float(np.mean(np.abs(all_positions))),
-        "mean_turnover": float(np.mean(all_turnover)),
-        "n_episodes": len(returns_list),
-    }
-    return metrics
-
-
-def compute_rollout_diagnostics(actions_buf, obs_buf, horizons, target_horizon):
+def compute_rollout_diagnostics(actions_buf, obs_buf, horizons):
     """
     Compute per-iteration diagnostics from rollout data.
 
@@ -199,15 +147,15 @@ def compute_rollout_diagnostics(actions_buf, obs_buf, horizons, target_horizon):
     actions = np.concatenate(actions_buf, axis=0)  # (steps*envs, act_dim)
     obs = np.concatenate(obs_buf, axis=0)
 
-    # Find horizon index for target_horizon
-    h_idx = min(range(len(horizons)), key=lambda i: abs(horizons[i] - target_horizon))
     H = len(horizons)
 
-    # Position is obs[:, 0] (position_normalized for signal_exposure)
+    # Observation layout:
+    # [position_norm, time_remaining, bid_active, live_k_bid,
+    #  offer_active, live_k_offer, mu_1..mu_H, sigma_1..sigma_H]
     positions = obs[:, 0]
-    mu_h = obs[:, 3 + h_idx]
-    sigma_h = obs[:, 3 + H + h_idx]
-    z_h = mu_h / (sigma_h + 1e-8)
+    mu_long = obs[:, 6 + H - 1]
+    sigma_long = obs[:, 6 + 2 * H - 1]
+    z_long = mu_long / (sigma_long + 1e-8)
 
     mean_abs_action = float(np.mean(np.abs(actions)))
     mean_abs_position = float(np.mean(np.abs(positions)))
@@ -218,12 +166,12 @@ def compute_rollout_diagnostics(actions_buf, obs_buf, horizons, target_horizon):
     # Fraction near-zero actions (|action| < 0.05)
     frac_near_zero = float(np.mean(np.abs(actions) < 0.05))
 
-    # Correlation between action and z_h
-    if actions.shape[1] == 1:
-        action_flat = actions[:, 0]
+    # Use the aggressive-decision channel as a simple directional proxy.
+    action_flat = actions[:, 0]
+    if len(action_flat) > 1 and np.std(action_flat) > 1e-12 and np.std(z_long) > 1e-12:
+        corr = float(np.corrcoef(action_flat, z_long)[0, 1])
     else:
-        action_flat = actions[:, 1]  # skew dimension for market-making
-    corr = float(np.corrcoef(action_flat, z_h)[0, 1]) if len(action_flat) > 1 else 0.0
+        corr = 0.0
 
     return {
         "mean_abs_action": mean_abs_action,
@@ -251,7 +199,7 @@ def train(
     Train the RL market-making agent.
 
     Args:
-        config: RL hyperparams (half_spread, n_sigma, etc.)
+        config: RL hyperparams
         returns: (T, N_total) full returns array
         stock_split: dict with 'rl_train', 'rl_val', 'test' keys
         save_dir: where to save RL checkpoints
@@ -300,10 +248,9 @@ def train(
         print("[INFO] Using momentum predictor")
 
     print(f"[INFO] Normalization: mean={norm_mean:.4f}, std={norm_std:.4f}")
-    print(f"[INFO] Horizons: {horizons} (H={H}, obs_dim={3 + 2*H})")
+    print(f"[INFO] Horizons: {horizons} (H={H}, obs_dim={6 + 2*H})")
 
     # Extract config
-    reward_mode = config.get("reward_mode", "signal_exposure")
     n_envs = config.get("n_envs", 4)
     n_iterations = config.get("n_iterations", 500)
     rollout_steps = config.get("rollout_steps", 2048)
@@ -316,78 +263,32 @@ def train(
     target_kl = config.get("target_kl", 0.02)
     normalize_rewards = config.get("normalize_rewards", True)
 
-    # Phase 1 experiment knobs
     ent_coef_anneal = config.get("ent_coef_anneal", True)
-    ablate_penalties = config.get("ablate_penalties", False)
     disable_reward_norm = config.get("disable_reward_norm", False)
-    action_space_type = config.get("action_space", "continuous")
     use_uncertainty = config.get("use_uncertainty", False)
-    reward_horizon = config.get("reward_horizon", 8)
-
-    # Signal exposure params
-    target_horizon = config.get("target_horizon", 16)
-    reward_scale = config.get("reward_scale", 10.0)
-    alpha_pos = config.get("alpha_pos", 0.01)
-    beta_trade = config.get("beta_trade", 0.005)
-    max_position = config.get("max_position", 1.0)
-    baseline_k = config.get("baseline_k", 1.0)
-
-    # Market-making env parameters (used when reward_mode == "full_market_making")
     half_spread = config.get("half_spread", 0.001)
-    target_vol = config.get("target_vol", 0.02)
-
-    # Auto-load R² from transformer metrics if not explicitly set
-    r_squared = config.get("r_squared", None)
-    if r_squared is None and transformer_checkpoint:
-        experiment_dir = os.path.dirname(transformer_checkpoint)
-        metrics_path = os.path.join(experiment_dir, "results", "metrics.json")
-        if os.path.exists(metrics_path):
-            with open(metrics_path) as f:
-                metrics = json.load(f)
-            r_squared = max(metrics.get("r2_vs_naive", 0.01), 1e-4)
-            print(f"[INFO] Auto-loaded R²={r_squared:.4f} from transformer metrics")
-    if r_squared is None:
-        r_squared = 0.01
-    n_sigma = config.get("n_sigma", 2.0)
-    tau = config.get("tau", 20)
+    max_position = config.get("max_position", 5)
+    k_max = config.get("k_max", 3.0)
+    kappa_base = config.get("kappa_base", 1e-4)
+    kappa_close = config.get("kappa_close", 5e-4)
     lambda2 = config.get("lambda2", 1.5)
-    max_width = config.get("max_width", 3.0)
-    max_skew = config.get("max_skew", 3.0)
 
     T = returns.shape[0]
     n_rl_stocks = len(rl_train_stocks)
 
-    # Determine action dimension based on reward mode and action space
-    if action_space_type == "discrete3":
-        act_dim = 3  # 3 discrete actions
-    elif reward_mode in ("signal_exposure", "horizon_aligned"):
-        act_dim = 1
-    else:
-        act_dim = 2
+    act_dim = 5
 
-    print(f"\n[INFO] === Phase 1 RL Config ===")
-    print(f"[INFO] reward_mode       = {reward_mode}")
+    print(f"\n[INFO] === RL Config ===")
     print(f"[INFO] gamma             = {gamma}")
-    print(f"[INFO] ablate_penalties  = {ablate_penalties}")
     print(f"[INFO] disable_reward_norm = {disable_reward_norm}")
-    print(f"[INFO] action_space      = {action_space_type}")
     print(f"[INFO] use_uncertainty   = {use_uncertainty}")
     print(f"[INFO] ent_coef_anneal   = {ent_coef_anneal}")
-    if reward_mode in ("signal_exposure", "horizon_aligned"):
-        print(f"[INFO] target_horizon    = {target_horizon}")
-        print(f"[INFO] reward_horizon    = {reward_horizon}")
-        print(f"[INFO] reward_scale      = {reward_scale}")
-        print(f"[INFO] alpha_pos         = {alpha_pos}")
-        print(f"[INFO] beta_trade        = {beta_trade}")
-        print(f"[INFO] max_position      = {max_position}")
-        print(f"[INFO] baseline_k        = {baseline_k}")
-    else:
-        print(f"[INFO] half_spread       = {half_spread}")
-        print(f"[INFO] target_vol        = {target_vol}")
-        print(f"[INFO] R²               = {r_squared}")
-        print(f"[INFO] n_sigma           = {n_sigma}")
-        print(f"[INFO] tau               = {tau}")
-        print(f"[INFO] lambda2           = {lambda2}")
+    print(f"[INFO] half_spread       = {half_spread}")
+    print(f"[INFO] max_position      = {max_position}")
+    print(f"[INFO] k_max             = {k_max}")
+    print(f"[INFO] kappa_base        = {kappa_base}")
+    print(f"[INFO] kappa_close       = {kappa_close}")
+    print(f"[INFO] lambda2           = {lambda2}")
 
     def make_env_data(n):
         """Create n episodes, each a full trading day from a random RL train stock."""
@@ -407,67 +308,25 @@ def train(
         return ret_list, mu_list, sigma_list
 
     def make_vec_env(ret_list, mu_list, sigma_list):
-        """Create vectorized env based on reward_mode."""
-        if reward_mode in ("signal_exposure", "horizon_aligned"):
-            return VectorizedSignalExposureEnv(
-                ret_list, mu_list, sigma_list,
-                target_horizon=target_horizon,
-                reward_scale=reward_scale,
-                alpha_pos=alpha_pos,
-                beta_trade=beta_trade,
-                max_position=max_position,
-                ablate_penalties=ablate_penalties,
-                reward_mode=reward_mode,
-                reward_horizon=reward_horizon,
-                action_space_type=action_space_type,
-            )
-        else:
-            return VectorizedMarketEnv(
-                ret_list, mu_list, sigma_list,
-                half_spread=half_spread,
-                target_vol=target_vol,
-                r_squared=r_squared,
-                n_sigma=n_sigma,
-                tau=tau,
-                lambda2=lambda2,
-                max_width=max_width,
-                max_skew=max_skew,
-            )
-
-    # --- Baseline evaluation (signal_exposure modes) ---
-    if reward_mode in ("signal_exposure", "horizon_aligned"):
-        print(f"\n[INFO] === Baseline Evaluation (k={baseline_k}) ===")
-        baseline_ret, baseline_mu, baseline_sigma = make_env_data(min(n_rl_stocks, 10))
-        baseline_metrics = evaluate_baseline(
-            baseline_ret, baseline_mu, baseline_sigma,
-            horizons=horizons,
-            target_horizon=target_horizon,
-            baseline_k=baseline_k,
+        return VectorizedMarketEnv(
+            ret_list, mu_list, sigma_list,
+            half_spread=half_spread,
             max_position=max_position,
-            reward_scale=reward_scale,
-            alpha_pos=alpha_pos,
-            beta_trade=beta_trade,
-            ablate_penalties=ablate_penalties,
-            reward_mode=reward_mode,
-            reward_horizon=reward_horizon,
+            k_max=k_max,
+            kappa_base=kappa_base,
+            kappa_close=kappa_close,
+            lambda2=lambda2,
         )
-        print(f"[INFO] Baseline mean episode reward: {baseline_metrics['mean_episode_reward']:.4f} "
-              f"(±{baseline_metrics['std_episode_reward']:.4f})")
-        print(f"[INFO] Baseline mean |position|:     {baseline_metrics['mean_abs_position']:.4f}")
-        print(f"[INFO] Baseline mean turnover:        {baseline_metrics['mean_turnover']:.4f}")
 
     # Policy
-    obs_dim = 3 + 2 * H
+    obs_dim = 6 + 2 * H
     log_std_init = config.get("log_std_init", -0.5)
     log_std_min = config.get("log_std_min", -3.0)
     log_std_max = config.get("log_std_max", 1.0)
-    if action_space_type == "discrete3":
-        policy = CategoricalActorCritic(obs_dim=obs_dim, n_actions=3, hidden=64).to(device)
-    else:
-        policy = ActorCritic(obs_dim=obs_dim, act_dim=act_dim, hidden=64,
-                             log_std_init=log_std_init,
-                             log_std_min=log_std_min,
-                             log_std_max=log_std_max).to(device)
+    policy = ActorCritic(obs_dim=obs_dim, act_dim=act_dim, hidden=64,
+                         log_std_init=log_std_init,
+                         log_std_min=log_std_min,
+                         log_std_max=log_std_max).to(device)
     optimizer = torch.optim.Adam([
         {"params": policy.actor_params(), "lr": actor_lr},
         {"params": policy.critic_params(), "lr": critic_lr},
@@ -490,8 +349,7 @@ def train(
     low_action_streak = 0
     COLLAPSE_WARN_THRESHOLD = 10  # warn after this many consecutive low-action iters
 
-    # Baseline reward for logging (0.0 if not signal_exposure)
-    baseline_rew_val = baseline_metrics["mean_episode_reward"] if reward_mode in ("signal_exposure", "horizon_aligned") else 0.0
+    baseline_rew_val = 0.0
 
     print(
         f"\n{'Iter':>5} {'MeanRew':>10} {'BaseRew':>10} {'PolLoss':>10} {'VLoss':>10} "
@@ -541,10 +399,7 @@ def train(
         with torch.no_grad():
             obs_norm = (obs - obs_rms.mean) / obs_rms.std
             obs_t = torch.tensor(obs_norm, dtype=torch.float32, device=device)
-            if action_space_type == "discrete3":
-                _, last_values = policy.forward(obs_t)
-            else:
-                _, _, last_values = policy.forward(obs_t)
+            _, _, last_values = policy.forward(obs_t)
             last_values = last_values.cpu().numpy()
 
         buffer.compute_returns_and_advantages(last_values, gamma, lam)
@@ -565,7 +420,7 @@ def train(
             break
 
         # Diagnostics
-        diag = compute_rollout_diagnostics(raw_actions_buf, raw_obs_buf, horizons, target_horizon)
+        diag = compute_rollout_diagnostics(raw_actions_buf, raw_obs_buf, horizons)
 
         mean_reward = np.mean(episode_rewards)
         raw_rew_std = float(np.std(np.concatenate(raw_rewards_buf)))  # RewScaleObserved
@@ -635,22 +490,17 @@ def train(
         print(f"[INFO] Last 20 iters: mean_reward={avg_rew:.4f}, "
               f"|pos|={avg_pos:.4f}, |action|={avg_act:.4f}, signal_corr={avg_corr:.4f}")
 
-        if reward_mode in ("signal_exposure", "horizon_aligned"):
-            base_rew = baseline_metrics["mean_episode_reward"]
-            print(f"[INFO] Baseline reward was: {base_rew:.4f}")
+        # Simple market-making success gate: non-trivial inventory usage and
+        # non-degenerate action magnitude in at least one recent iteration.
+        for row in last20:
+            if row["mean_abs_position"] >= 0.1 and row["mean_abs_action"] >= 0.05:
+                success_gate = True
+                break
 
-            # Success gate: any of last 20 has MeanRew >= 0.7*BaselineRew AND MeanAbsPos >= 0.25
-            for row in last20:
-                if row["mean_reward"] >= 0.7 * base_rew and row["mean_abs_position"] >= 0.25:
-                    success_gate = True
-                    break
-
-            if success_gate:
-                print("[INFO] ✓ SUCCESS GATE PASSED (MeanRew >= 0.7*BaselineRew AND |Pos| >= 0.25)")
-            elif avg_rew > base_rew:
-                print("[INFO] ✓ PPO is beating the linear baseline (but success gate not passed)")
-            else:
-                print("[INFO] ✗ PPO has not yet matched the linear baseline")
+        if success_gate:
+            print("[INFO] ✓ SUCCESS GATE PASSED (non-trivial position and action usage)")
+        else:
+            print("[INFO] ✗ Policy still looks close to degenerate")
     elif len(log_rows) > 0:
         last = log_rows[-min(10, len(log_rows)):]
         avg_rew = np.mean([r["mean_reward"] for r in last])
@@ -668,14 +518,11 @@ def train(
 
     save_config = {
         **config,
-        "reward_mode": reward_mode,
         "stock_split": stock_split,
         "transformer_checkpoint": transformer_checkpoint,
         "total_time": total_time,
         "success_gate": success_gate,
     }
-    if reward_mode in ("signal_exposure", "horizon_aligned"):
-        save_config["baseline_metrics"] = baseline_metrics
     with open(os.path.join(save_dir, "config.json"), "w") as f:
         json.dump(save_config, f, indent=2)
 
@@ -696,10 +543,10 @@ if __name__ == "__main__":
     parser.add_argument("--actor_lr", type=float, default=3e-4)
     parser.add_argument("--critic_lr", type=float, default=1e-3)
     parser.add_argument("--half_spread", type=float, default=0.001)
-    parser.add_argument("--target_vol", type=float, default=0.02)
-    parser.add_argument("--r_squared", type=float, default=0.01)
-    parser.add_argument("--n_sigma", type=float, default=2.0)
-    parser.add_argument("--tau", type=int, default=20)
+    parser.add_argument("--max_position", type=int, default=5)
+    parser.add_argument("--k_max", type=float, default=3.0)
+    parser.add_argument("--kappa_base", type=float, default=1e-4)
+    parser.add_argument("--kappa_close", type=float, default=5e-4)
     parser.add_argument("--lambda2", type=float, default=1.5)
     args = parser.parse_args()
 

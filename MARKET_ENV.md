@@ -13,6 +13,51 @@
 
 ---
 
+## Action Space
+
+Each step, the agent chooses:
+
+1. **Aggressive action** — exactly one of:
+   - `none`
+   - `buy_aggressive`
+   - `sell_aggressive`
+
+2. **Passive bid placement**
+   - either place no passive bid
+   - or place one passive bid at
+
+   ```text
+   b(t) = mid(t) - k_bid(t) * half_spread
+   ```
+
+   with `k_bid(t) > -1`
+
+3. **Passive offer placement**
+   - either place no passive offer
+   - or place one passive offer at
+
+   ```text
+   o(t) = mid(t) + k_offer(t) * half_spread
+   ```
+
+   with `k_offer(t) > -1`
+
+All orders have **unit size**.
+
+### Interpretation of `k`
+
+For both `k_bid` and `k_offer`:
+
+- `k = 1` → quote at the current market touch
+- `0 < k < 1` → quote inside the spread
+- `k = 0` → quote at mid
+- `-1 < k < 0` → quote beyond mid but still non-marketable
+- `k -> -1` → maximally aggressive passive quote without crossing the opposite touch
+
+Aggressive trading is handled only by the explicit aggressive action. Passive quote prices must remain strictly non-marketable, hence `k > -1` rather than `k >= -1`.
+
+---
+
 ## Fill Rules
 
 At each step t, two independent checks are made.
@@ -23,8 +68,8 @@ Agent's *current* quote crosses the *current* market.
 
 | Condition | Trade | Fill price |
 |---|---|---|
-| b(t) >= om(t) | Agent buys | om(t) — agent pays spread |
-| o(t) <= bm(t) | Agent sells | bm(t) — agent pays spread |
+| aggressive action = `buy_aggressive` | Agent buys | om(t) — agent pays spread |
+| aggressive action = `sell_aggressive` | Agent sells | bm(t) — agent pays spread |
 
 Agent is the price taker. Fill price is worse than mid.
 
@@ -51,10 +96,10 @@ Agent is the price maker. Fill price is better than mid (at fill time).
 half_spread = 0.02
 mid(t) = 100.00  →  bm(t) = 99.98,  om(t) = 100.02
 
-Agent quotes: b(t) = 100.05  (above om(t))
+Aggressive action: buy_aggressive
 
-Check aggressive: b(t)=100.05 >= om(t)=100.02  ✓
-→ Buy at 100.02  (paid 0.02 above mid)
+Check aggressive action  ✓
+→ Buy at 100.02  (paid one half_spread above mid)
 ```
 
 ---
@@ -66,7 +111,8 @@ half_spread = 0.02
 mid(t-1) = 100.00  →  bm(t-1) = 99.98,  om(t-1) = 100.02
 mid(t)   = 100.06  →  bm(t)   = 100.04, om(t)   = 100.08
 
-Agent's previous quote: o(t-1) = 100.03  (inside market at t-1, resting)
+Agent placed a passive offer at t-1 with k_offer(t-1)=1.5
+o(t-1) = mid(t-1) + 1.5 * 0.02 = 100.03
 
 Check passive: bm(t)=100.04 >= o(t-1)=100.03  ✓
 → Sell at 100.03  (received 0.03 above mid at t-1; market moved up, so now below new mid — passive fill is not guaranteed to be profitable)
@@ -81,13 +127,13 @@ half_spread = 0.02
 mid(t-1) = 100.00  →  om(t-1) = 100.02
 mid(t)   = 100.01  →  bm(t)   = 99.99,  om(t) = 100.03
 
-Agent quotes at t:   b(t)   = 99.90,  o(t)   = 100.10  (passive, wide)
-Agent quotes at t-1: b(t-1) = 99.90,  o(t-1) = 100.10
+No aggressive action at t
+Passive bid from t-1:   b(t-1) = 99.90
+Passive offer from t-1: o(t-1) = 100.10
 
-Aggressive: b(t)=99.90 < om(t)=100.03  ✗
-            o(t)=100.10 > bm(t)=99.99  ✗
-Passive:    om(t)=100.03 <= b(t-1)=99.90  ✗
-            bm(t)=99.99 >= o(t-1)=100.10  ✗
+Aggressive: none  ✗
+Passive:    om(t)=100.03 <= b(t-1)=99.90   ✗
+            bm(t)=99.99  >= o(t-1)=100.10  ✗
 → No fill
 ```
 
@@ -99,17 +145,31 @@ Passive:    om(t)=100.03 <= b(t-1)=99.90  ✗
 half_spread = 0.02
 mid(t) = 100.00  →  bm(t) = 99.98,  om(t) = 100.02
 
-Agent quotes: o(t) = 99.95  (below bm(t))
+Aggressive action: sell_aggressive
 
-Check aggressive: o(t)=99.95 <= bm(t)=99.98  ✓
-→ Sell at 99.98  (received 0.02 below mid)
+Check aggressive action  ✓
+→ Sell at 99.98  (received one half_spread below mid)
 ```
 
 ---
 
 ## Multiple fills in the same step
 
-All four conditions are checked independently. Any combination that fires results in a fill. Same-side fills (e.g. aggressive buy + passive buy) are both executed — position change is the sum of all fills in the step.
+The aggressive action and the passive fill checks are independent. In a single step:
+
+- the agent may execute at most one aggressive trade: buy, sell, or none
+- the previous passive bid may fill
+- the previous passive offer may fill
+
+So multiple fills in one step are possible. For example:
+
+- aggressive buy + passive buy
+- aggressive buy + passive sell
+- aggressive sell + passive buy
+- aggressive sell + passive sell
+- passive bid fill + passive offer fill
+
+Position change is the sum of all fills in the step.
 
 Position constraints, if introduced, are enforced at order placement: an order that would breach the limit is not submitted, so no fill condition for it is ever checked. No position limit is currently enforced.
 
@@ -120,4 +180,8 @@ Position constraints, if introduced, are enforced at order placement: an order t
 - Aggressive fills always cost the spread; they are only rational if the agent has a strong directional signal.
 - Passive fills earn the spread but are not guaranteed: the market may have moved adversely by the time the fill occurs (as in Example 2).
 - `half_spread` is a fixed environment parameter, not chosen by the agent.
-- The action space under this model is 1D (how aggressively/passively to quote) rather than the previous 2D (independent bid/ask offsets).
+- The action space under this model has:
+  - one discrete aggressive decision
+  - optional passive bid placement with a chosen `k_bid`
+  - optional passive offer placement with a chosen `k_offer`
+- Quote prices are expressed in units of `half_spread`, which keeps the action scale stable across price levels.
