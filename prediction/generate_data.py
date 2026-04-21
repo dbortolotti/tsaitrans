@@ -28,8 +28,12 @@ Outputs:
 import numpy as np
 import json
 import argparse
+import logging
 import os
 from datetime import datetime
+
+
+logger = logging.getLogger(__name__)
 
 
 def make_stable_matrix(K: int, spectral_radius: float, rng: np.random.Generator) -> np.ndarray:
@@ -231,14 +235,20 @@ def save(result: dict, output_dir: str, tag: str):
     with open(meta_path, "w") as f:
         json.dump(result["params"], f, indent=2)
 
-    print(f"Saved: {returns_path}")
-    print(f"Saved: {gt_path}")
-    print(f"Saved: {meta_path}")
-    print(f"  mean SNR: {result['params']['mean_snr']:.3f}")
-    print(f"  median SNR: {result['params']['median_snr']:.3f}")
+    logger.info("Saved: %s", returns_path)
+    logger.info("Saved: %s", gt_path)
+    logger.info("Saved: %s", meta_path)
+    logger.info("  mean SNR: %.3f", result["params"]["mean_snr"])
+    logger.info("  median SNR: %.3f", result["params"]["median_snr"])
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
     parser = argparse.ArgumentParser(description="Generate synthetic factor model data")
     parser.add_argument("--n_stocks", type=int, default=50)
     parser.add_argument("--n_timesteps", type=int, default=2000)

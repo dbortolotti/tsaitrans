@@ -32,6 +32,7 @@ def main(experiment_dir: str, seed: int = None, deterministic: bool = False):
 
     data_cfg = config["data"]
     rl_cfg = config.get("rl", {})
+    base_experiment = config.get("base_experiment")
 
     # Use a different seed from training so we get a fresh realization
     if seed is None:
@@ -67,11 +68,10 @@ def main(experiment_dir: str, seed: int = None, deterministic: bool = False):
 
     # --- Load normalization stats ---
     checkpoint_dir = os.path.join(experiment_dir, "checkpoints")
+    if not os.path.exists(checkpoint_dir) and base_experiment:
+        checkpoint_dir = os.path.join("output", base_experiment, "checkpoints")
     norm_mean = float(np.load(os.path.join(checkpoint_dir, "mean.npy")))
     norm_std = float(np.load(os.path.join(checkpoint_dir, "std.npy")))
-
-    # --- Normalize returns (same as RL training) ---
-    returns_normed = (returns_raw - norm_mean) / norm_std
 
     # --- Load transformer and generate predictions ---
     from model import FactorTransformer, normalize_horizons
@@ -129,10 +129,10 @@ def main(experiment_dir: str, seed: int = None, deterministic: bool = False):
     # --- Load RL policy ---
     from policy import ActorCritic
 
-    obs_dim = 3 + 2 * H
+    obs_dim = 6 + 2 * H
     rl_dir = os.path.join(experiment_dir, "checkpoints_rl")
     policy = ActorCritic(
-        obs_dim=obs_dim, act_dim=2, hidden=64,
+        obs_dim=obs_dim, act_dim=5, hidden=64,
         log_std_init=rl_cfg.get("log_std_init", -0.5),
         log_std_min=rl_cfg.get("log_std_min", -3.0),
         log_std_max=rl_cfg.get("log_std_max", 1.0),
@@ -165,13 +165,14 @@ def main(experiment_dir: str, seed: int = None, deterministic: bool = False):
         mu_predictions=mu_predictions,
         sigma_predictions=sigma_predictions,
         half_spread=rl_cfg.get("half_spread", 0.001),
-        target_vol=data_cfg.get("target_vol", 0.02),
-        r_squared=rl_cfg.get("r_squared", 0.01),
-        n_sigma=rl_cfg.get("n_sigma", 1.0),
-        tau=rl_cfg.get("tau", 20),
+        max_position=rl_cfg.get("max_position", 5),
+        k_max=rl_cfg.get("k_max", 3.0),
+        kappa_base=rl_cfg.get("kappa_base", 1e-4),
+        kappa_close=rl_cfg.get("kappa_close", 5e-4),
         lambda2=rl_cfg.get("lambda2", 1.5),
-        max_width=rl_cfg.get("max_width", 3.0),
-        max_skew=rl_cfg.get("max_skew", 3.0),
+        alignment_coef=rl_cfg.get("alignment_coef", 0.05),
+        alignment_clip=rl_cfg.get("alignment_clip", 3.0),
+        trade_penalty=rl_cfg.get("trade_penalty", 0.0),
     )
 
     obs, _ = env.reset()
@@ -205,8 +206,8 @@ def main(experiment_dir: str, seed: int = None, deterministic: bool = False):
         },
         "times": log["times"],
         "mid_prices": [round(p, 4) for p in log["mid_prices"]],
-        "bids": [round(p, 4) for p in log["bids"]],
-        "asks": [round(p, 4) for p in log["asks"]],
+        "bids": [round(p, 4) if np.isfinite(p) else None for p in log["bid_prices"]],
+        "asks": [round(p, 4) if np.isfinite(p) else None for p in log["offer_prices"]],
         "positions": log["positions"],
         "cum_pnl": [round(p, 4) for p in cum_pnl],
         "fills_buy_t": log["fills_buy_t"],

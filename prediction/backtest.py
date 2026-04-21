@@ -22,6 +22,7 @@ Can also be imported and called from run_experiment.py.
 
 import argparse
 import json
+import logging
 import os
 import sys
 
@@ -34,6 +35,9 @@ import matplotlib.pyplot as plt
 from model import FactorTransformer, TimeSeriesDataset, get_device, normalize_horizons
 import torch
 from torch.utils.data import DataLoader
+
+
+logger = logging.getLogger(__name__)
 
 
 def load_predictions(checkpoint_dir, returns, stock_indices):
@@ -162,7 +166,7 @@ def run_backtest(checkpoint_dir, returns, test_stocks, results_dir, half_spread=
     Tests linear and threshold strategies across parameter sweeps.
     If the model is probabilistic, also tests z-score strategies.
     """
-    print("Loading predictions...")
+    logger.info("Loading predictions...")
     preds, targets, sigmas, mean, std, config = load_predictions(
         checkpoint_dir, returns, test_stocks
     )
@@ -177,29 +181,31 @@ def run_backtest(checkpoint_dir, returns, test_stocks, results_dir, half_spread=
     # Half-spread in normalised units
     half_spread_norm = half_spread / (std + 1e-8)
 
-    print(f"Samples: {len(mu_total)}")
-    print(f"Horizons: {horizons} (signal from longest: h={horizons[-1]})")
-    print(f"Half-spread (raw): {half_spread}")
-    print(f"Half-spread (norm): {half_spread_norm:.6f}")
-    print(f"Signal std: {np.std(mu_total):.6f}")
-    print(f"Signal mean: {np.mean(mu_total):.6f}")
+    logger.info("Samples: %d", len(mu_total))
+    logger.info("Horizons: %s (signal from longest: h=%s)", horizons, horizons[-1])
+    logger.info("Half-spread (raw): %s", half_spread)
+    logger.info("Half-spread (norm): %.6f", half_spread_norm)
+    logger.info("Signal std: %.6f", np.std(mu_total))
+    logger.info("Signal mean: %.6f", np.mean(mu_total))
 
     results = {"config": {"half_spread": half_spread, "horizons": horizons,
                            "probabilistic": probabilistic, "test_stocks": test_stocks}}
 
     # --- Linear strategy: position = k * mu_total ---
-    print("\n--- Linear Strategy: position = k * signal ---")
+    logger.info("--- Linear Strategy: position = k * signal ---")
     k_values = [0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0]
     linear_results = []
     for k in k_values:
         r = run_strategy(mu_total, ret_total, half_spread_norm, "linear", k=k)
         linear_results.append({"k": k, **r})
-        print(f"  k={k:5.1f} | PnL={r['total_pnl']:8.4f} | Sharpe={r['sharpe']:7.2f} | "
-              f"Edge/trade={r['edge_per_trade']:8.6f} | Turnover={r['total_turnover']:8.1f}")
+        logger.info(
+            "  k=%5.1f | PnL=%8.4f | Sharpe=%7.2f | Edge/trade=%8.6f | Turnover=%8.1f",
+            k, r["total_pnl"], r["sharpe"], r["edge_per_trade"], r["total_turnover"],
+        )
     results["linear"] = linear_results
 
     # --- Threshold strategy: position = sign(signal) if |signal| > theta ---
-    print("\n--- Threshold Strategy: position = sign(signal) if |signal| > θ ---")
+    logger.info("--- Threshold Strategy: position = sign(signal) if |signal| > θ ---")
     signal_std = np.std(mu_total)
     theta_values = [0.0, 0.25 * signal_std, 0.5 * signal_std, signal_std,
                     1.5 * signal_std, 2.0 * signal_std]
@@ -207,8 +213,10 @@ def run_backtest(checkpoint_dir, returns, test_stocks, results_dir, half_spread=
     for theta in theta_values:
         r = run_strategy(mu_total, ret_total, half_spread_norm, "threshold", theta=theta)
         threshold_results.append({"theta": float(theta), "theta_sigma": float(theta / signal_std), **r})
-        print(f"  θ={theta/signal_std:4.2f}σ | PnL={r['total_pnl']:8.4f} | Sharpe={r['sharpe']:7.2f} | "
-              f"Trades={r['n_trades']:5d} | PnL/trade={r['pnl_per_trade']:8.6f}")
+        logger.info(
+            "  θ=%4.2fσ | PnL=%8.4f | Sharpe=%7.2f | Trades=%5d | PnL/trade=%8.6f",
+            theta / signal_std, r["total_pnl"], r["sharpe"], r["n_trades"], r["pnl_per_trade"],
+        )
     results["threshold"] = threshold_results
 
     # --- Z-score strategy (probabilistic only) ---
@@ -216,12 +224,12 @@ def run_backtest(checkpoint_dir, returns, test_stocks, results_dir, half_spread=
         sigma_long = sigmas[:, -1, 0]  # longest horizon sigma (no aggregation)
         z = mu_total / (sigma_long + 1e-8)
 
-        print(f"\n--- Z-Score Signal Stats ---")
-        print(f"  mean |z|: {np.mean(np.abs(z)):.4f}")
-        print(f"  |z| > 1: {np.mean(np.abs(z) > 1.0):.1%}")
-        print(f"  |z| > 2: {np.mean(np.abs(z) > 2.0):.1%}")
+        logger.info("--- Z-Score Signal Stats ---")
+        logger.info("  mean |z|: %.4f", np.mean(np.abs(z)))
+        logger.info("  |z| > 1: %.1f%%", 100 * np.mean(np.abs(z) > 1.0))
+        logger.info("  |z| > 2: %.1f%%", 100 * np.mean(np.abs(z) > 2.0))
 
-        print("\n--- Z-Score Strategy: position = k * z if |z| > θ ---")
+        logger.info("--- Z-Score Strategy: position = k * z if |z| > θ ---")
         z_params = [
             (1.0, 0.0), (1.0, 0.5), (1.0, 1.0), (1.0, 1.5), (1.0, 2.0),
             (2.0, 0.5), (2.0, 1.0), (5.0, 1.0), (5.0, 2.0),
@@ -230,13 +238,14 @@ def run_backtest(checkpoint_dir, returns, test_stocks, results_dir, half_spread=
         for k, theta in z_params:
             r = run_strategy(z, ret_total, half_spread_norm, "zscore", k=k, theta=theta)
             zscore_results.append({"k": k, "theta": theta, **r})
-            print(f"  k={k:4.1f} θ={theta:4.1f} | PnL={r['total_pnl']:8.4f} | "
-                  f"Sharpe={r['sharpe']:7.2f} | Trades={r['n_trades']:5d} | "
-                  f"PnL/trade={r['pnl_per_trade']:8.6f}")
+            logger.info(
+                "  k=%4.1f θ=%4.1f | PnL=%8.4f | Sharpe=%7.2f | Trades=%5d | PnL/trade=%8.6f",
+                k, theta, r["total_pnl"], r["sharpe"], r["n_trades"], r["pnl_per_trade"],
+            )
         results["zscore"] = zscore_results
 
     # --- Signal bucketing: E[return | signal_bin] ---
-    print("\n--- Signal Bucketing: E[return | signal_bin] ---")
+    logger.info("--- Signal Bucketing: E[return | signal_bin] ---")
     n_bins = 10
     bin_edges = np.percentile(mu_total, np.linspace(0, 100, n_bins + 1))
     bin_edges[0] = -np.inf
@@ -257,18 +266,20 @@ def run_backtest(checkpoint_dir, returns, test_stocks, results_dir, half_spread=
             "profitable_vs_cost": float(abs(mean_return) > half_spread_norm),
         })
         marker = " ***" if abs(mean_return) > half_spread_norm else ""
-        print(f"  bin {b:2d} | signal={mean_signal:8.5f} | E[ret]={mean_return:8.5f} | "
-              f"n={count:5d}{marker}")
+        logger.info(
+            "  bin %2d | signal=%8.5f | E[ret]=%8.5f | n=%5d%s",
+            b, mean_signal, mean_return, count, marker,
+        )
     results["buckets"] = bucket_results
 
-    print(f"\n  (*** = |E[return]| > half_spread_norm = {half_spread_norm:.6f})")
+    logger.info("(*** = |E[return]| > half_spread_norm = %.6f)", half_spread_norm)
 
     # Save results
     os.makedirs(results_dir, exist_ok=True)
     results_path = os.path.join(results_dir, "backtest.json")
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
-    print(f"\nResults saved: {results_path}")
+    logger.info("Results saved: %s", results_path)
 
     # Plot
     _plot_backtest(results, results_dir, half_spread_norm)
@@ -344,10 +355,16 @@ def _plot_backtest(results, results_dir, half_spread_norm):
     save_path = os.path.join(results_dir, "backtest.png")
     plt.savefig(save_path, dpi=120, bbox_inches="tight")
     plt.close()
-    print(f"Backtest plot saved: {save_path}")
+    logger.info("Backtest plot saved: %s", save_path)
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
     parser = argparse.ArgumentParser(description="Phase 0: Analytical signal backtest")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--data", type=str, required=True)

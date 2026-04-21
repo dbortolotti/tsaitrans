@@ -1,0 +1,67 @@
+{
+  "data": {
+    "target_vol": 0.02,
+    "snr": 0.3,
+    "factor_half_life": 0.1,
+    "noise_half_life_range": [
+      0.005,
+      0.025
+    ],
+    "n_factors": 3,
+    "steps_per_day": 2000,
+    "n_steps": 2000,
+    "seed": 42,
+    "stocks_transformer_train": 50,
+    "stocks_transformer_val": 10,
+    "stocks_rl_train": 12,
+    "stocks_rl_val": 4,
+    "stocks_test": 10
+  },
+  "transformer": {
+    "context_len": 200,
+    "horizons": [
+      1,
+      2,
+      4,
+      8,
+      16
+    ],
+    "d_model": 64,
+    "n_heads": 4,
+    "n_layers": 3,
+    "ffn_dim": 256,
+    "dropout": 0.1,
+    "batch_size": 128,
+    "lr": 0.0003,
+    "n_epochs": 100,
+    "patience": 15,
+    "seed": 42,
+    "probabilistic": true
+  },
+  "rl": {
+    "predictor": "transformer",
+    "half_spread": 0.001,
+    "max_position": 3,
+    "k_max": 2.0,
+    "kappa_base": 5e-06,
+    "kappa_close": 0.0,
+    "lambda2": 1.5,
+    "alignment_coef": 0.01,
+    "alignment_clip": 3.0,
+    "trade_penalty": 0.0002,
+    "n_envs": 4,
+    "n_iterations": 200,
+    "rollout_steps": 1024,
+    "actor_lr": 0.0003,
+    "critic_lr": 0.001,
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "ent_coef": 0.001,
+    "ent_coef_end": 0.0001,
+    "target_kl": 0.02,
+    "disable_reward_norm": false,
+    "ent_coef_anneal": true,
+    "use_uncertainty": false
+  },
+  "base_experiment": "mm_stable_reuse_latest_transformer"
+}

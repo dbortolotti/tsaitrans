@@ -1,212 +1,234 @@
 """
 grid_search.py
 
-Grid search over RL parameters using an existing experiment's data and transformer.
+Config-driven RL grid search for the current market-making setup.
+
+The grid search works by generating experiment JSON files that reuse a base
+experiment's data and transformer checkpoint via `base_experiment`, then
+optionally running them sequentially through `run_experiment.py`.
 
 Usage:
-    python grid_search.py -i output/experiment2 -o grid3
-    python grid_search.py -i output/experiment2 -o grid3 --config experiments/grid.json
-
-Creates output/<name>_ns{n_sigma}_l2{lambda2}/ for each combination,
-symlinks data + transformer checkpoints, runs RL training + 10 simulations.
+    python grid_search.py --config experiments/mm_reward_grid.json --generate-only
+    python -u grid_search.py --config experiments/mm_reward_grid.json 2>&1 | tee log_mm_reward_grid.txt
 """
 
-import json
-import os
-import shutil
-import sys
+import argparse
 import itertools
-import time
+import json
+import logging
+import os
+import subprocess
+import sys
+from copy import deepcopy
 
 
-# --- Grid ---
-N_SIGMA_VALUES = [0.0, 0.1, 0.2, 0.5, 1.0, 2.0]
-LAMBDA2_VALUES = [0.0, 1.5, 10.0]
-
-N_SIMS = 10
+logger = logging.getLogger(__name__)
 
 
-def main(base_experiment: str, output_name: str, config_path: str):
-    # Load config from JSON file
-    if not os.path.exists(config_path):
-        print(f"[ERROR] {config_path} not found", flush=True)
-        sys.exit(1)
+def configure_logging(level: int = logging.INFO):
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
 
-    with open(config_path) as f:
-        base_config = json.load(f)
 
-    # Check required dirs exist
-    data_dir = os.path.join(base_experiment, "data")
-    checkpoint_dir = os.path.join(base_experiment, "checkpoints")
-    results_dir = os.path.join(base_experiment, "results")
-    for d in [data_dir, checkpoint_dir, results_dir]:
-        if not os.path.exists(d):
-            print(f"[ERROR] {d} not found", flush=True)
-            sys.exit(1)
+def load_json(path: str) -> dict:
+    with open(path) as f:
+        return json.load(f)
 
-    combos = list(itertools.product(N_SIGMA_VALUES, LAMBDA2_VALUES))
-    print(f"Grid search: {len(combos)} combinations x {N_SIMS} sims each", flush=True)
-    print(f"  n_sigma:  {N_SIGMA_VALUES}", flush=True)
-    print(f"  lambda2:  {LAMBDA2_VALUES}", flush=True)
-    print(f"  Base:     {base_experiment}", flush=True)
-    print(f"  Output:   output/{output_name}_*/", flush=True)
-    print("=" * 60, flush=True)
 
-    # Add module dirs to path
-    repo_root = os.path.dirname(os.path.abspath(__file__))
-    for d in ["prediction", "placing"]:
-        p = os.path.join(repo_root, d)
-        if p not in sys.path:
-            sys.path.insert(0, p)
+def slugify_value(value):
+    if isinstance(value, float):
+        text = f"{value:.8g}"
+    else:
+        text = str(value)
+    return text.replace("-", "m").replace(".", "p")
 
-    from train_rl import train as train_rl
-    from simulate import main as simulate
 
-    import numpy as np
+def deep_merge(base: dict, updates: dict) -> dict:
+    merged = deepcopy(base)
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
 
-    # Load returns once
-    data_files = [f for f in os.listdir(data_dir) if f.startswith("returns_") and f.endswith(".npy")]
-    if not data_files:
-        print(f"[ERROR] No returns file found in {data_dir}", flush=True)
-        sys.exit(1)
-    returns = np.load(os.path.join(data_dir, data_files[0]))
 
-    # Compute stock split
-    data_cfg = base_config["data"]
-    idx = 0
-    stock_split = {}
-    for name, key in [
-        ("transformer_train", "stocks_transformer_train"),
-        ("transformer_val", "stocks_transformer_val"),
-        ("rl_train", "stocks_rl_train"),
-        ("rl_val", "stocks_rl_val"),
-        ("test", "stocks_test"),
-    ]:
-        count = data_cfg[key]
-        stock_split[name] = list(range(idx, idx + count))
-        idx += count
+def read_train_summary(run_dir: str) -> dict:
+    log_path = os.path.join(run_dir, "checkpoints_rl", "train_log.json")
+    if not os.path.exists(log_path):
+        return {"status": "missing_train_log"}
 
-    t_total = time.time()
+    rows = load_json(log_path)
+    if not rows:
+        return {"status": "empty_train_log"}
 
-    for i, (n_sigma, lambda2) in enumerate(combos):
-        run_name = f"{output_name}_ns{n_sigma}_l2{lambda2}"
-        run_dir = os.path.join("output", run_name)
+    best_cum_pnl = max(row.get("mean_cumulative_pnl", float("-inf")) for row in rows)
+    best_sharpe = max(row.get("sharpe", float("-inf")) for row in rows)
+    best_corr = max(row.get("action_signal_corr", float("-inf")) for row in rows)
+    last = rows[-1]
+    tail = rows[-min(20, len(rows)) :]
 
-        print(f"\n{'=' * 60}", flush=True)
-        print(f"[{i+1}/{len(combos)}] n_sigma={n_sigma}, lambda2={lambda2}", flush=True)
-        print(f"  Output: {run_dir}", flush=True)
-        print("=" * 60, flush=True)
+    return {
+        "status": "ok",
+        "n_iters": len(rows),
+        "last_mean_reward": last.get("mean_reward"),
+        "last_cum_pnl": last.get("mean_cumulative_pnl"),
+        "last_sharpe": last.get("sharpe"),
+        "last_corr": last.get("action_signal_corr"),
+        "last_abs_pos": last.get("mean_abs_position"),
+        "best_cum_pnl": best_cum_pnl,
+        "best_sharpe": best_sharpe,
+        "best_corr": best_corr,
+        "tail_mean_cum_pnl": sum(r.get("mean_cumulative_pnl", 0.0) for r in tail) / len(tail),
+        "tail_mean_sharpe": sum(r.get("sharpe", 0.0) for r in tail) / len(tail),
+        "tail_mean_corr": sum(r.get("action_signal_corr", 0.0) for r in tail) / len(tail),
+        "tail_mean_abs_pos": sum(r.get("mean_abs_position", 0.0) for r in tail) / len(tail),
+    }
 
-        os.makedirs(run_dir, exist_ok=True)
 
-        # Symlink data and checkpoints (avoid copying large files)
-        for subdir in ["data", "checkpoints", "results"]:
-            link = os.path.join(run_dir, subdir)
-            target = os.path.abspath(os.path.join(base_experiment, subdir))
-            if os.path.exists(link):
-                if os.path.islink(link):
-                    os.remove(link)
-                else:
-                    shutil.rmtree(link)
-            os.symlink(target, link)
+def build_experiment_config(base_config: dict, base_experiment: str, rl_updates: dict) -> dict:
+    config = deepcopy(base_config)
+    config["base_experiment"] = base_experiment
+    config["rl"] = deep_merge(config.get("rl", {}), rl_updates)
+    return config
 
-        # Build RL config
-        rl_base = base_config.get("rl", {})
-        rl_cfg = {
-            "predictor": rl_base.get("predictor", "transformer"),
-            "n_envs": rl_base.get("n_envs", 4),
-            "n_iterations": rl_base.get("n_iterations", 500),
-            "rollout_steps": rl_base.get("rollout_steps", 2048),
-            "actor_lr": rl_base.get("actor_lr", 3e-4),
-            "critic_lr": rl_base.get("critic_lr", 1e-3),
-            "gamma": rl_base.get("gamma", 0.99),
-            "gae_lambda": rl_base.get("gae_lambda", 0.95),
-            "ent_coef": rl_base.get("ent_coef", 5e-4),
-            "ent_coef_end": rl_base.get("ent_coef_end", 1e-5),
-            "target_kl": rl_base.get("target_kl", 0.02),
-            "log_std_init": rl_base.get("log_std_init", -0.5),
-            "log_std_min": rl_base.get("log_std_min", -3.0),
-            "log_std_max": rl_base.get("log_std_max", 1.0),
-            "half_spread": 0.0005,
-            "target_vol": data_cfg.get("target_vol", 0.02),
-            "tau": 20,
-            "max_width": 3.0,
-            "max_skew": 3.0,
-            "n_sigma": n_sigma,
-            "lambda2": lambda2,
+
+def main(config_path: str, generate_only: bool = False):
+    spec = load_json(config_path)
+
+    base_experiment = spec["base_experiment"]
+    output_prefix = spec["output_prefix"]
+    base_config_path = spec.get("base_config", f"experiments/{base_experiment}.json")
+    generated_dir = spec.get("generated_dir", os.path.join("experiments", "generated", output_prefix))
+    grid = spec["grid"]
+    fixed_rl = spec.get("fixed_rl", {})
+    fixed_top_level = spec.get("fixed_top_level", {})
+    run_args = spec.get("run_args", ["--skip-backtest"])
+
+    if not os.path.exists(base_config_path):
+        raise FileNotFoundError(f"Base config not found: {base_config_path}")
+
+    base_config = load_json(base_config_path)
+    os.makedirs(generated_dir, exist_ok=True)
+
+    keys = list(grid.keys())
+    combos = list(itertools.product(*(grid[key] for key in keys)))
+
+    logger.info("Grid search spec: %s", config_path)
+    logger.info("Base experiment: %s", base_experiment)
+    logger.info("Base config: %s", base_config_path)
+    logger.info("Output prefix: %s", output_prefix)
+    logger.info("Generated configs: %s", generated_dir)
+    logger.info("Grid keys: %s", keys)
+    logger.info("Combinations: %d", len(combos))
+
+    summary_rows = []
+
+    for idx, values in enumerate(combos, start=1):
+        rl_updates = deepcopy(fixed_rl)
+        label_parts = []
+        for key, value in zip(keys, values):
+            rl_updates[key] = value
+            label_parts.append(f"{key}{slugify_value(value)}")
+
+        run_name = f"{output_prefix}__" + "__".join(label_parts)
+        config_data = build_experiment_config(base_config, base_experiment, rl_updates)
+        config_data = deep_merge(config_data, fixed_top_level)
+
+        config_file = os.path.join(generated_dir, f"{run_name}.json")
+        with open(config_file, "w") as f:
+            json.dump(config_data, f, indent=2)
+
+        row = {
+            "run_name": run_name,
+            "config_path": config_file,
+            **{key: value for key, value in zip(keys, values)},
         }
 
-        # Save config for this run
-        run_config = dict(base_config)
-        run_config["rl"] = rl_cfg
-        with open(os.path.join(run_dir, "resolved_config.json"), "w") as f:
-            json.dump(run_config, f, indent=2)
+        logger.info("[%d/%d] Prepared %s", idx, len(combos), run_name)
 
-        # Train RL
-        rl_dir = os.path.join(run_dir, "checkpoints_rl")
-        t_start = time.time()
-        try:
-            train_rl(
-                rl_cfg,
-                returns,
-                stock_split,
-                rl_dir,
-                transformer_checkpoint=os.path.join(run_dir, "checkpoints"),
-            )
-        except Exception as e:
-            print(f"[ERROR] RL training failed: {e}", flush=True)
+        if generate_only:
+            row["status"] = "generated_only"
+            summary_rows.append(row)
             continue
 
-        # Run N_SIMS simulations with different seeds
-        sim_results = []
-        base_seed = data_cfg.get("seed", 42) + 1000
-        for s in range(N_SIMS):
-            seed = base_seed + s
-            try:
-                result = simulate(run_dir, seed=seed, deterministic=True)
-                sim_results.append(result["summary"])
-                print(f"  sim {s+1}/{N_SIMS}: seed={seed}  PnL={result['summary']['total_pnl']:.4f}  "
-                      f"Fills={result['summary']['n_total_fills']}  Avg|Pos|={result['summary']['avg_abs_position']:.2f}", flush=True)
-            except Exception as e:
-                print(f"  sim {s+1}/{N_SIMS}: [ERROR] {e}", flush=True)
+        cmd = [sys.executable, "-u", "run_experiment.py", config_file, *run_args]
+        logger.info("Running: %s", " ".join(cmd))
+        run_dir = os.path.join("output", run_name)
+        os.makedirs(run_dir, exist_ok=True)
+        log_path = os.path.join(run_dir, "grid_run.log")
+        row["log_path"] = log_path
 
-        # Save aggregated sim summary
-        if sim_results:
-            pnls = [r["total_pnl"] for r in sim_results]
-            positions = [r["avg_abs_position"] for r in sim_results]
-            fills = [r["n_total_fills"] for r in sim_results]
-            summary = {
-                "n_sims": len(sim_results),
-                "pnl_mean": float(np.mean(pnls)),
-                "pnl_std": float(np.std(pnls)),
-                "pnl_median": float(np.median(pnls)),
-                "avg_position_mean": float(np.mean(positions)),
-                "avg_fills": float(np.mean(fills)),
-                "individual": sim_results,
-            }
-            with open(os.path.join(rl_dir, "sim_summary.json"), "w") as f:
-                json.dump(summary, f, indent=2)
-            print(f"  Summary: PnL={summary['pnl_mean']:.4f} +/- {summary['pnl_std']:.4f}  "
-                  f"Avg|Pos|={summary['avg_position_mean']:.2f}  Fills={summary['avg_fills']:.0f}", flush=True)
+        with open(log_path, "w") as log_file:
+            completed = subprocess.run(
+                cmd,
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+                stdin=subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+            )
+        row["exit_code"] = int(completed.returncode)
 
-        elapsed = time.time() - t_start
-        print(f"[DONE] {run_name} in {elapsed:.1f}s", flush=True)
+        row.update(read_train_summary(run_dir))
+        summary_rows.append(row)
 
-    total = time.time() - t_total
-    print(f"\n{'=' * 60}", flush=True)
-    print(f"Grid search complete in {total:.1f}s", flush=True)
-    print(f"Results in: output/{output_name}_*/", flush=True)
-    print("=" * 60, flush=True)
+        if completed.returncode != 0:
+            logger.warning("Run failed: %s", run_name)
+        else:
+            logger.info(
+                "Finished %s | tail_cum_pnl=%.4f tail_sharpe=%.2f tail_corr=%.4f tail_|pos|=%.4f",
+                run_name,
+                row.get("tail_mean_cum_pnl", float("nan")),
+                row.get("tail_mean_sharpe", float("nan")),
+                row.get("tail_mean_corr", float("nan")),
+                row.get("tail_mean_abs_pos", float("nan")),
+            )
+
+    summary_path = os.path.join(generated_dir, "summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(summary_rows, f, indent=2)
+
+    logger.info("Saved summary to %s", summary_path)
+
+    successful = [row for row in summary_rows if row.get("status") == "ok"]
+    if successful:
+        ranked = sorted(
+            successful,
+            key=lambda row: (
+                row.get("tail_mean_cum_pnl", float("-inf")),
+                row.get("tail_mean_sharpe", float("-inf")),
+                row.get("tail_mean_corr", float("-inf")),
+            ),
+            reverse=True,
+        )
+        best = ranked[0]
+        logger.info(
+            "Best run so far: %s | tail_cum_pnl=%.4f tail_sharpe=%.2f tail_corr=%.4f tail_|pos|=%.4f",
+            best["run_name"],
+            best.get("tail_mean_cum_pnl", float("nan")),
+            best.get("tail_mean_sharpe", float("nan")),
+            best.get("tail_mean_corr", float("nan")),
+            best.get("tail_mean_abs_pos", float("nan")),
+        )
 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Grid search over RL parameters")
-    parser.add_argument("-i", "--input", required=True,
-                        help="Path to base experiment output (e.g. output/experiment2)")
-    parser.add_argument("-o", "--output", required=True,
-                        help="Output name prefix (results go to output/<name>_ns*_l2*/)")
-    parser.add_argument("--config", default="experiments/grid.json",
-                        help="JSON config for base params (default: experiments/grid.json)")
+    parser = argparse.ArgumentParser(description="Config-driven RL grid search")
+    parser.add_argument(
+        "--config",
+        required=True,
+        help="Grid-search spec JSON, e.g. experiments/mm_reward_grid.json",
+    )
+    parser.add_argument(
+        "--generate-only",
+        action="store_true",
+        help="Only create the experiment JSON files, do not run them",
+    )
     args = parser.parse_args()
-    main(args.input, args.output, args.config)
+
+    configure_logging()
+    main(args.config, generate_only=args.generate_only)
