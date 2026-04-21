@@ -362,8 +362,8 @@ def train(
     baseline_rew_val = 0.0
 
     logger.info(
-        "%5s %10s %10s %10s %10s %10s %10s %8s %8s %8s %8s %10s %10s %7s",
-        "Iter", "MeanRew", "BaseRew", "PolLoss", "VLoss", "Entropy", "KL",
+        "%5s %10s %10s %8s %10s %10s %10s %10s %8s %8s %8s %8s %10s %10s %7s",
+        "Iter", "MeanRew", "CumPnL", "Sharpe", "PolLoss", "VLoss", "Entropy", "KL",
         "|Act|", "|Pos|", "Corr", "LogStd", "RawRewStd", "RewStd", "Time",
     )
     logger.info("%s", "-" * 135)
@@ -381,18 +381,26 @@ def train(
         obs_rms.update(obs)
         episode_rewards = []
         raw_rewards_buf = []
+        raw_pnl_buf = []
         raw_actions_buf = []
         raw_obs_buf = []
+        rollout_cum_pnl = None
 
         for step in range(rollout_steps):
             obs_norm = (obs - obs_rms.mean) / obs_rms.std
             obs_t = torch.tensor(obs_norm, dtype=torch.float32, device=device)
             actions, log_probs, values = policy.get_action(obs_t)
 
-            next_obs, rewards, dones = vec_env.step(actions)
+            next_obs, rewards, dones, infos = vec_env.step(actions)
 
             obs_rms.update(next_obs)
             raw_rewards_buf.append(rewards.copy())
+            raw_pnl_buf.append(
+                np.array([info.get("step_pnl", 0.0) for info in infos], dtype=np.float64)
+            )
+            rollout_cum_pnl = np.array(
+                [info.get("cumulative_pnl", 0.0) for info in infos], dtype=np.float64
+            )
             if disable_reward_norm:
                 rewards_norm = rewards
             else:
@@ -433,6 +441,10 @@ def train(
 
         mean_reward = np.mean(episode_rewards)
         raw_rew_std = float(np.std(np.concatenate(raw_rewards_buf)))  # RewScaleObserved
+        pnl_series = np.concatenate(raw_pnl_buf) if raw_pnl_buf else np.array([0.0])
+        mean_cum_pnl = float(np.mean(rollout_cum_pnl)) if rollout_cum_pnl is not None else 0.0
+        pnl_std = float(np.std(pnl_series))
+        sharpe = float(np.mean(pnl_series) / (pnl_std + 1e-10) * np.sqrt(len(pnl_series)))
         log_std_val = policy.actor_log_std.data.mean().item()
         kl_flag = " KL!" if ppo_metrics.get("early_stopped", False) else ""
         elapsed = time.time() - iter_start
@@ -449,8 +461,8 @@ def train(
             collapse_flag += " ⚠ LOW-ENT"
 
         logger.info(
-            "%5d %10.4f %10.4f %10.4f %10.4f %10.4f %10.4f %8.4f %8.4f %8.4f %8.4f %10.6f %10.2f %6.1fs%s%s",
-            iteration, mean_reward, baseline_rew_val, ppo_metrics["policy_loss"],
+            "%5d %10.4f %10.4f %8.2f %10.4f %10.4f %10.4f %10.4f %8.4f %8.4f %8.4f %8.4f %10.6f %10.2f %6.1fs%s%s",
+            iteration, mean_reward, mean_cum_pnl, sharpe, ppo_metrics["policy_loss"],
             ppo_metrics["value_loss"], ppo_metrics["entropy"], ppo_metrics["approx_kl"],
             diag["mean_abs_action"], diag["mean_abs_position"], diag["action_signal_corr"],
             log_std_val, raw_rew_std, float(reward_rms.std), elapsed, kl_flag, collapse_flag,
@@ -460,7 +472,8 @@ def train(
             {
                 "iteration": iteration,
                 "mean_reward": float(mean_reward),
-                "baseline_reward": baseline_rew_val,
+                "mean_cumulative_pnl": mean_cum_pnl,
+                "sharpe": sharpe,
                 "reward_std": float(np.std(episode_rewards)),
                 "raw_reward_std": raw_rew_std,
                 **ppo_metrics,

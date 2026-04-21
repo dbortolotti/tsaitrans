@@ -167,7 +167,10 @@ class MarketMakingEnv(gym.Env):
 
     def step(self, action):
         if self.t >= self.T - 1:
-            return self._get_obs(), 0.0, True, False, {}
+            return self._get_obs(), 0.0, True, False, {
+                "step_pnl": 0.0,
+                "cumulative_pnl": self.cumulative_pnl,
+            }
 
         raw = np.asarray(action, dtype=np.float64)
         if raw.shape != (5,):
@@ -270,7 +273,10 @@ class MarketMakingEnv(gym.Env):
 
         self.t += 1
 
-        return self._get_obs(), reward, terminated, False, {}
+        return self._get_obs(), reward, terminated, False, {
+            "step_pnl": pnl_step,
+            "cumulative_pnl": self.cumulative_pnl,
+        }
 
     def get_log(self):
         """Return the trading log as a dict of lists."""
@@ -293,13 +299,14 @@ class VectorizedMarketEnv:
 
     def step(self, actions):
         """actions: (n_envs, 5)"""
-        obs_list, rew_list, done_list = [], [], []
+        obs_list, rew_list, done_list, info_list = [], [], [], []
         for i, env in enumerate(self.envs):
             obs, rew, term, trunc, info = env.step(actions[i])
             done = term or trunc
+            info_list.append(info)
             if done:
                 obs, _ = env.reset()
             obs_list.append(obs)
             rew_list.append(rew)
             done_list.append(done)
-        return np.stack(obs_list), np.array(rew_list), np.array(done_list)
+        return np.stack(obs_list), np.array(rew_list), np.array(done_list), info_list
