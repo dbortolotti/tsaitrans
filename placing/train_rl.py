@@ -282,6 +282,9 @@ def train(
     kappa_base = config.get("kappa_base", 1e-4)
     kappa_close = config.get("kappa_close", 5e-4)
     lambda2 = config.get("lambda2", 1.5)
+    alignment_coef = config.get("alignment_coef", 0.05)
+    alignment_clip = config.get("alignment_clip", 3.0)
+    trade_penalty = config.get("trade_penalty", 0.0)
 
     T = returns.shape[0]
     n_rl_stocks = len(rl_train_stocks)
@@ -299,6 +302,9 @@ def train(
     logger.info("kappa_base          = %s", kappa_base)
     logger.info("kappa_close         = %s", kappa_close)
     logger.info("lambda2             = %s", lambda2)
+    logger.info("alignment_coef      = %s", alignment_coef)
+    logger.info("alignment_clip      = %s", alignment_clip)
+    logger.info("trade_penalty       = %s", trade_penalty)
 
     def make_env_data(n):
         """Create n episodes, each a full trading day from a random RL train stock."""
@@ -326,6 +332,9 @@ def train(
             kappa_base=kappa_base,
             kappa_close=kappa_close,
             lambda2=lambda2,
+            alignment_coef=alignment_coef,
+            alignment_clip=alignment_clip,
+            trade_penalty=trade_penalty,
         )
 
     # Policy

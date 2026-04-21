@@ -33,6 +33,9 @@ class MarketMakingEnv(gym.Env):
         kappa_base: float = 1e-4,         # base quadratic inventory cost
         kappa_close: float = 5e-4,        # extra inventory cost near the close
         lambda2: float = 1.5,             # terminal liquidation multiplier
+        alignment_coef: float = 0.05,     # reward weight on forecast-aligned inventory
+        alignment_clip: float = 3.0,      # clip longest-horizon z-score before rewarding alignment
+        trade_penalty: float = 0.0,       # optional penalty on inventory changes
         initial_price: float = 100.0,
     ):
         super().__init__()
@@ -53,6 +56,9 @@ class MarketMakingEnv(gym.Env):
         self.kappa_base = float(kappa_base)
         self.kappa_close = float(kappa_close)
         self.lambda2 = float(lambda2)
+        self.alignment_coef = float(alignment_coef)
+        self.alignment_clip = float(alignment_clip)
+        self.trade_penalty = float(trade_penalty)
         self.initial_price = float(initial_price)
         self._k_epsilon = 1e-6
 
@@ -101,6 +107,8 @@ class MarketMakingEnv(gym.Env):
             "inventory_pnls": [],
             "fill_pnls": [],
             "inventory_penalties": [],
+            "alignment_rewards": [],
+            "trade_penalties": [],
             "terminal_costs": [],
             "cumulative_pnls": [],
             "bid_active": [],
@@ -158,6 +166,13 @@ class MarketMakingEnv(gym.Env):
         progress = self.t / max(self.T - 1, 1)
         kappa_t = self.kappa_base + self.kappa_close * (progress ** 2)
         return kappa_t * (position_after ** 2)
+
+    def _alignment_reward(self, position_after: int) -> float:
+        mu_long = float(self.mu_predictions[self.t, -1])
+        sigma_long = float(self.sigma_predictions[self.t, -1])
+        z_long = mu_long / max(sigma_long, 1e-8)
+        z_long = float(np.clip(z_long, -self.alignment_clip, self.alignment_clip))
+        return self.alignment_coef * position_after * self.half_spread * z_long
 
     def _can_buy(self) -> bool:
         return self.position + 1 <= self.max_position
@@ -231,7 +246,9 @@ class MarketMakingEnv(gym.Env):
         self.cumulative_pnl += pnl_step
 
         inventory_penalty = self._inventory_penalty(self.position)
-        reward = pnl_step - inventory_penalty
+        alignment_reward = self._alignment_reward(self.position)
+        trade_penalty = self.trade_penalty * abs(self.position - position_before)
+        reward = pnl_step - inventory_penalty + alignment_reward - trade_penalty
 
         terminated = self.t >= self.T - 2
         terminal_cost = 0.0
@@ -253,6 +270,8 @@ class MarketMakingEnv(gym.Env):
         self.log["inventory_pnls"].append(inventory_pnl)
         self.log["fill_pnls"].append(fill_pnl)
         self.log["inventory_penalties"].append(inventory_penalty)
+        self.log["alignment_rewards"].append(alignment_reward)
+        self.log["trade_penalties"].append(trade_penalty)
         self.log["terminal_costs"].append(terminal_cost)
         self.log["cumulative_pnls"].append(self.cumulative_pnl)
         self.log["bid_active"].append(float(next_bid_active))

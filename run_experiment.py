@@ -107,6 +107,9 @@ DEFAULTS = {
         "n_sigma": 2.0,
         "tau": 20,
         "lambda2": 1.5,
+        "alignment_coef": 0.05,
+        "alignment_clip": 3.0,
+        "trade_penalty": 0.0,
         "max_width": 3.0,
         "max_skew": 3.0,
     },
@@ -158,6 +161,7 @@ def main(config_path: str, skip_data: bool = False, skip_transformer: bool = Fal
     with open(config_path) as f:
         user_config = json.load(f)
     config = merge_config(DEFAULTS, user_config)
+    user_data_overrides = user_config.get("data", {})
 
     name = os.path.splitext(os.path.basename(config_path))[0]
     output_dir = os.path.join("output", name)
@@ -197,8 +201,10 @@ def main(config_path: str, skip_data: bool = False, skip_transformer: bool = Fal
         if os.path.exists(base_resolved):
             with open(base_resolved) as f:
                 base_config = json.load(f)
-            # Use base experiment's data config for stock split (must match)
-            config["data"] = base_config["data"]
+            # Reuse the base experiment's DGP by default, but preserve any
+            # explicit data overrides from the current config such as smaller
+            # RL train/val stock counts for sweeps.
+            config["data"] = merge_config(base_config["data"], user_data_overrides)
 
     # --- Compute stock split ---
     data_cfg = config["data"]

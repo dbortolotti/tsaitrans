@@ -63,10 +63,16 @@ obs_t = [
 
 ## Reward Function
 
-Per-step reward is the economic outcome of the transition from `t` to `t+1`:
+Per-step reward is the economic outcome of the transition from `t` to `t+1`,
+plus a small incentive to hold inventory in the direction of the forecast:
 
 ```text
-reward_t = inventory_pnl_t + fill_pnl_t - inventory_penalty_t
+reward_t
+= inventory_pnl_t
++ fill_pnl_t
+- inventory_penalty_t
++ alignment_reward_t
+- trade_penalty_t
 ```
 
 with terminal liquidation cost applied on the last step:
@@ -126,9 +132,38 @@ This is a simple time-varying quadratic inventory cost:
 - **early in the episode**: inventory is penalized lightly
 - **near the close**: inventory is penalized more heavily
 
-The penalty is intentionally simple. It does not depend directly on transformer
-`R^2`; the transformer horizon structure is already available through
-`mu_1..mu_H` and `sigma_1..sigma_H` in the state.
+The penalty is intentionally mild. It controls pathological inventory build-up,
+but it is no longer the main mechanism forcing the policy to stay near flat.
+
+### Forecast alignment reward
+
+The reward uses only the longest-horizon forecast as a single directional edge:
+
+```text
+z_long_t = clip(mu_H(t) / sigma_H(t), -alignment_clip, alignment_clip)
+alignment_reward_t = alignment_coef * position_after_t * half_spread * z_long_t
+```
+
+Interpretation:
+
+- positive forecast and long inventory earns a positive shaping term
+- negative forecast and short inventory earns a positive shaping term
+- inventory held against the forecast is penalized
+
+This term is deliberately small relative to the economic PnL. Its role is to
+make the transformer forecast easier for PPO to use, not to replace the market-
+making objective with a pure signal-following reward.
+
+### Trade penalty
+
+Optionally:
+
+```text
+trade_penalty_t = trade_penalty * abs(position_after_t - position_before_t)
+```
+
+This discourages pointless inventory flipping. The current suggested default is
+`0`, so the term is available but inactive unless explicitly turned on.
 
 ---
 
@@ -156,8 +191,10 @@ The policy is trained to:
 
 - earn spread when passive fills are attractive
 - use aggressive trades selectively
-- manage inventory through the day
+- hold inventory when the forecasted edge supports it
+- manage inventory through the day without over-penalizing useful risk-taking
 - finish close to flat
 
-The reward is intentionally economic and local. The transformer predictions
-inform the policy through the observation, not through a forecast-shaped reward.
+The reward is still rooted in realized market-making PnL, but it now includes a
+small forecast-alignment term so the policy has a direct incentive to use the
+transformer signal.

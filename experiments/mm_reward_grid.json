@@ -1,0 +1,28 @@
+{
+  "base_experiment": "mm_stable_reuse_latest_transformer",
+  "base_config": "experiments/mm_stable_reuse_latest_transformer.json",
+  "output_prefix": "mm_reward_grid",
+  "generated_dir": "experiments/generated/mm_reward_grid",
+  "run_args": ["--skip-backtest"],
+  "fixed_rl": {
+    "predictor": "transformer",
+    "kappa_close": 0.0,
+    "alignment_clip": 3.0,
+    "lambda2": 1.5,
+    "n_envs": 4,
+    "n_iterations": 200,
+    "rollout_steps": 1024
+  },
+  "fixed_top_level": {
+    "data": {
+      "stocks_rl_train": 12,
+      "stocks_rl_val": 4
+    }
+  },
+  "grid": {
+    "max_position": [3, 10],
+    "kappa_base": [1e-6, 5e-6, 2e-5],
+    "alignment_coef": [0.01, 0.02, 0.04],
+    "trade_penalty": [0.0, 0.0002]
+  }
+}
