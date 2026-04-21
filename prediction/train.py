@@ -21,6 +21,7 @@ Saves:
 import argparse
 import csv
 import json
+import logging
 import math
 import os
 import random
@@ -32,6 +33,9 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from model import FactorTransformer, get_device, make_splits, normalize_horizons
+
+
+logger = logging.getLogger(__name__)
 
 
 def seed_everything(seed: int):
@@ -64,8 +68,8 @@ def train(config: dict, returns: np.ndarray, stock_split: dict, save_dir: str):
     """
     seed_everything(config.get("seed", 42))
     device = get_device()
-    print(f"Using device: {device}")
-    print(f"Data shape: {returns.shape}")
+    logger.info("Using device: %s", device)
+    logger.info("Data shape: %s", returns.shape)
 
     context_len = config.get("context_len", 60)
     horizons = normalize_horizons(config)
@@ -74,10 +78,10 @@ def train(config: dict, returns: np.ndarray, stock_split: dict, save_dir: str):
     train_ds, val_ds, test_ds, mean, std = make_splits(
         returns, stock_split, context_len=context_len, horizons=horizons
     )
-    print(f"Train: {len(train_ds)} | Val: {len(val_ds)} | Test: {len(test_ds)} samples")
-    print(f"Horizons: {horizons} (cumulative return targets)")
-    print(f"Train stocks: {stock_split['transformer_train']}")
-    print(f"Val stocks:   {stock_split['transformer_val']}")
+    logger.info("Train: %d | Val: %d | Test: %d samples", len(train_ds), len(val_ds), len(test_ds))
+    logger.info("Horizons: %s (cumulative return targets)", horizons)
+    logger.info("Train stocks: %s", stock_split["transformer_train"])
+    logger.info("Val stocks:   %s", stock_split["transformer_val"])
 
     batch_size = config.get("batch_size", 128)
     train_loader = DataLoader(
@@ -100,9 +104,9 @@ def train(config: dict, returns: np.ndarray, stock_split: dict, save_dir: str):
         dropout=config.get("dropout", 0.1),
         probabilistic=probabilistic,
     ).to(device)
-    print(f"Parameters: {model.count_parameters():,}")
+    logger.info("Parameters: %s", f"{model.count_parameters():,}")
     if probabilistic:
-        print("Mode: probabilistic (heteroscedastic NLL loss)")
+        logger.info("Mode: probabilistic (heteroscedastic NLL loss)")
 
     n_epochs = config.get("n_epochs", 50)
     lr = config.get("lr", 3e-4)
@@ -175,10 +179,9 @@ def train(config: dict, returns: np.ndarray, stock_split: dict, save_dir: str):
         elapsed = time.time() - t_start
         current_lr = scheduler.get_last_lr()[0]
 
-        print(
-            f"Epoch {epoch:03d}/{n_epochs} | "
-            f"train={train_loss:.5f} | val={val_loss:.5f} | "
-            f"lr={current_lr:.2e} | {elapsed:.0f}s"
+        logger.info(
+            "Epoch %03d/%d | train=%.5f | val=%.5f | lr=%.2e | %.0fs",
+            epoch, n_epochs, train_loss, val_loss, current_lr, elapsed,
         )
 
         with open(log_path, "a", newline="") as f:
@@ -200,15 +203,21 @@ def train(config: dict, returns: np.ndarray, stock_split: dict, save_dir: str):
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                print(f"Early stopping at epoch {epoch} (patience={patience})")
+                logger.info("Early stopping at epoch %d (patience=%d)", epoch, patience)
                 break
 
-    print(f"\nBest val loss: {best_val_loss:.5f}")
-    print(f"Checkpoint: {save_dir}/best_model.pt")
+    logger.info("Best val loss: %.5f", best_val_loss)
+    logger.info("Checkpoint: %s/best_model.pt", save_dir)
     return best_val_loss
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=str, required=True, help="Path to returns .npy")
     parser.add_argument("--split", type=str, required=True,

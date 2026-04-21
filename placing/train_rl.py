@@ -17,6 +17,7 @@ Standalone usage:
 
 import argparse
 import json
+import logging
 import os
 import sys
 import time
@@ -30,6 +31,9 @@ try:
 except ImportError:
     from market_env import MarketMakingEnv, VectorizedMarketEnv
     from policy import ActorCritic, RolloutBuffer, RunningMeanStd, ppo_update
+
+
+logger = logging.getLogger(__name__)
 
 
 def load_transformer_predictions(returns, stock_indices, checkpoint_dir):
@@ -88,6 +92,10 @@ def load_transformer_predictions(returns, stock_indices, checkpoint_dir):
         mu_predictions = np.zeros((T, n_stocks, H))
         sigma_predictions = np.ones((T, n_stocks, H))  # ones default for deterministic
         ctx_len = config.get("context_len", 60)
+        logger.info(
+            "Generating transformer predictions for %d RL stocks with T=%d, context_len=%d",
+            n_stocks, T, ctx_len,
+        )
 
         with torch.no_grad():
             for si, stock_idx in enumerate(stock_indices):
@@ -105,14 +113,16 @@ def load_transformer_predictions(returns, stock_indices, checkpoint_dir):
                         pred = model(x)  # (1, H, 1)
                         mu_predictions[t, si, :] = pred[0, :, 0].cpu().numpy()
 
+                if (si + 1) % max(1, n_stocks // 10) == 0 or si + 1 == n_stocks:
+                    logger.info("Prediction loading progress: %d/%d RL stocks", si + 1, n_stocks)
+
         mode = "probabilistic" if probabilistic else "deterministic"
-        print(f"[INFO] Loaded transformer predictions from {checkpoint_dir} "
-              f"[{mode}, horizons={horizons}]")
+        logger.info("Loaded transformer predictions from %s [%s, horizons=%s]", checkpoint_dir, mode, horizons)
         return mu_predictions, sigma_predictions, mean, std, horizons
 
     except Exception as e:
-        print(f"[WARN] Could not load transformer: {e}")
-        print("[WARN] Falling back to momentum predictor")
+        logger.warning("Could not load transformer: %s", e)
+        logger.warning("Falling back to momentum predictor")
         return None
 
 
@@ -206,13 +216,13 @@ def train(
         transformer_checkpoint: path to transformer checkpoint dir (optional)
     """
     device = get_device()
-    print(f"[INFO] Using device: {device}")
-    print(f"[INFO] Data shape: {returns.shape}")
+    logger.info("Using device: %s", device)
+    logger.info("Data shape: %s", returns.shape)
 
     rl_train_stocks = stock_split["rl_train"]
     rl_val_stocks = stock_split["rl_val"]
-    print(f"[INFO] RL train stocks: {rl_train_stocks}")
-    print(f"[INFO] RL val stocks:   {rl_val_stocks}")
+    logger.info("RL train stocks: %s", rl_train_stocks)
+    logger.info("RL val stocks:   %s", rl_val_stocks)
 
     # Get predictions and normalization stats
     predictor = config.get("predictor", "transformer")
@@ -245,10 +255,10 @@ def train(
         mu_predictions, sigma_predictions = momentum_predictor(
             returns, rl_train_stocks, norm_mean, norm_std, horizons
         )
-        print("[INFO] Using momentum predictor")
+        logger.info("Using momentum predictor")
 
-    print(f"[INFO] Normalization: mean={norm_mean:.4f}, std={norm_std:.4f}")
-    print(f"[INFO] Horizons: {horizons} (H={H}, obs_dim={6 + 2*H})")
+    logger.info("Normalization: mean=%.4f, std=%.4f", norm_mean, norm_std)
+    logger.info("Horizons: %s (H=%d, obs_dim=%d)", horizons, H, 6 + 2 * H)
 
     # Extract config
     n_envs = config.get("n_envs", 4)
@@ -278,17 +288,17 @@ def train(
 
     act_dim = 5
 
-    print(f"\n[INFO] === RL Config ===")
-    print(f"[INFO] gamma             = {gamma}")
-    print(f"[INFO] disable_reward_norm = {disable_reward_norm}")
-    print(f"[INFO] use_uncertainty   = {use_uncertainty}")
-    print(f"[INFO] ent_coef_anneal   = {ent_coef_anneal}")
-    print(f"[INFO] half_spread       = {half_spread}")
-    print(f"[INFO] max_position      = {max_position}")
-    print(f"[INFO] k_max             = {k_max}")
-    print(f"[INFO] kappa_base        = {kappa_base}")
-    print(f"[INFO] kappa_close       = {kappa_close}")
-    print(f"[INFO] lambda2           = {lambda2}")
+    logger.info("=== RL Config ===")
+    logger.info("gamma               = %s", gamma)
+    logger.info("disable_reward_norm = %s", disable_reward_norm)
+    logger.info("use_uncertainty     = %s", use_uncertainty)
+    logger.info("ent_coef_anneal     = %s", ent_coef_anneal)
+    logger.info("half_spread         = %s", half_spread)
+    logger.info("max_position        = %s", max_position)
+    logger.info("k_max               = %s", k_max)
+    logger.info("kappa_base          = %s", kappa_base)
+    logger.info("kappa_close         = %s", kappa_close)
+    logger.info("lambda2             = %s", lambda2)
 
     def make_env_data(n):
         """Create n episodes, each a full trading day from a random RL train stock."""
@@ -337,8 +347,8 @@ def train(
     obs_rms = RunningMeanStd(shape=(obs_dim,))
 
     n_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
-    print(f"\n[INFO] Policy parameters: {n_params:,}", flush=True)
-    print(f"[INFO] Action dim: {act_dim}", flush=True)
+    logger.info("Policy parameters: %s", f"{n_params:,}")
+    logger.info("Action dim: %d", act_dim)
 
     os.makedirs(save_dir, exist_ok=True)
 
@@ -351,13 +361,12 @@ def train(
 
     baseline_rew_val = 0.0
 
-    print(
-        f"\n{'Iter':>5} {'MeanRew':>10} {'BaseRew':>10} {'PolLoss':>10} {'VLoss':>10} "
-        f"{'Entropy':>10} {'KL':>10} {'|Act|':>8} {'|Pos|':>8} {'Corr':>8} "
-        f"{'LogStd':>8} {'RawRewStd':>10} {'RewStd':>10} {'Time':>7}",
-        flush=True
+    logger.info(
+        "%5s %10s %10s %10s %10s %10s %10s %8s %8s %8s %8s %10s %10s %7s",
+        "Iter", "MeanRew", "BaseRew", "PolLoss", "VLoss", "Entropy", "KL",
+        "|Act|", "|Pos|", "Corr", "LogStd", "RawRewStd", "RewStd", "Time",
     )
-    print("-" * 135, flush=True)
+    logger.info("%s", "-" * 135)
 
     t_start = time.time()
 
@@ -416,7 +425,7 @@ def train(
         # NaN detection — abort gracefully instead of crashing
         has_nan = any(torch.isnan(p).any() for p in policy.parameters())
         if has_nan or np.isnan(ppo_metrics["policy_loss"]):
-            print(f"\n[WARN] NaN detected in policy at iteration {iteration} — aborting training early", flush=True)
+            logger.warning("NaN detected in policy at iteration %d - aborting training early", iteration)
             break
 
         # Diagnostics
@@ -439,16 +448,12 @@ def train(
         if ppo_metrics["entropy"] < 0.1:
             collapse_flag += " ⚠ LOW-ENT"
 
-        print(
-            f"{iteration:5d} {mean_reward:10.4f} {baseline_rew_val:10.4f} "
-            f"{ppo_metrics['policy_loss']:10.4f} "
-            f"{ppo_metrics['value_loss']:10.4f} {ppo_metrics['entropy']:10.4f} "
-            f"{ppo_metrics['approx_kl']:10.4f} "
-            f"{diag['mean_abs_action']:8.4f} {diag['mean_abs_position']:8.4f} "
-            f"{diag['action_signal_corr']:8.4f} "
-            f"{log_std_val:8.4f} {raw_rew_std:10.6f} {float(reward_rms.std):10.2f} "
-            f"{elapsed:6.1f}s{kl_flag}{collapse_flag}",
-            flush=True
+        logger.info(
+            "%5d %10.4f %10.4f %10.4f %10.4f %10.4f %10.4f %8.4f %8.4f %8.4f %8.4f %10.6f %10.2f %6.1fs%s%s",
+            iteration, mean_reward, baseline_rew_val, ppo_metrics["policy_loss"],
+            ppo_metrics["value_loss"], ppo_metrics["entropy"], ppo_metrics["approx_kl"],
+            diag["mean_abs_action"], diag["mean_abs_position"], diag["action_signal_corr"],
+            log_std_val, raw_rew_std, float(reward_rms.std), elapsed, kl_flag, collapse_flag,
         )
 
         log_rows.append(
@@ -476,8 +481,8 @@ def train(
                      obs_mean=obs_rms.mean, obs_var=obs_rms.var, obs_count=obs_rms.count)
 
     total_time = time.time() - t_start
-    print(f"\n[INFO] Training complete in {total_time:.1f}s", flush=True)
-    print(f"[INFO] Best mean reward: {best_reward:.4f}", flush=True)
+    logger.info("Training complete in %.1fs", total_time)
+    logger.info("Best mean reward: %.4f", best_reward)
 
     # Final summary + success gate
     success_gate = False
@@ -487,8 +492,10 @@ def train(
         avg_pos = np.mean([r["mean_abs_position"] for r in last20])
         avg_act = np.mean([r["mean_abs_action"] for r in last20])
         avg_corr = np.mean([r["action_signal_corr"] for r in last20])
-        print(f"[INFO] Last 20 iters: mean_reward={avg_rew:.4f}, "
-              f"|pos|={avg_pos:.4f}, |action|={avg_act:.4f}, signal_corr={avg_corr:.4f}")
+        logger.info(
+            "Last 20 iters: mean_reward=%.4f, |pos|=%.4f, |action|=%.4f, signal_corr=%.4f",
+            avg_rew, avg_pos, avg_act, avg_corr,
+        )
 
         # Simple market-making success gate: non-trivial inventory usage and
         # non-degenerate action magnitude in at least one recent iteration.
@@ -498,16 +505,18 @@ def train(
                 break
 
         if success_gate:
-            print("[INFO] ✓ SUCCESS GATE PASSED (non-trivial position and action usage)")
+            logger.info("SUCCESS GATE PASSED (non-trivial position and action usage)")
         else:
-            print("[INFO] ✗ Policy still looks close to degenerate")
+            logger.info("Policy still looks close to degenerate")
     elif len(log_rows) > 0:
         last = log_rows[-min(10, len(log_rows)):]
         avg_rew = np.mean([r["mean_reward"] for r in last])
         avg_act = np.mean([r["mean_abs_action"] for r in last])
         avg_corr = np.mean([r["action_signal_corr"] for r in last])
-        print(f"[INFO] Last iters: mean_reward={avg_rew:.4f}, "
-              f"|action|={avg_act:.4f}, signal_corr={avg_corr:.4f}")
+        logger.info(
+            "Last iters: mean_reward=%.4f, |action|=%.4f, signal_corr=%.4f",
+            avg_rew, avg_act, avg_corr,
+        )
 
     torch.save(policy.state_dict(), os.path.join(save_dir, "final_policy.pt"))
     np.savez(os.path.join(save_dir, "final_normalizer.npz"),
@@ -526,10 +535,16 @@ def train(
     with open(os.path.join(save_dir, "config.json"), "w") as f:
         json.dump(save_config, f, indent=2)
 
-    print(f"[INFO] Saved to {save_dir}/")
+    logger.info("Saved to %s/", save_dir)
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
     parser = argparse.ArgumentParser(description="Train RL market-making agent")
     parser.add_argument("--data", type=str, required=True, help="Path to returns .npy")
     parser.add_argument("--transformer", type=str, default=None,

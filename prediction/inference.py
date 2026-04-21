@@ -16,6 +16,7 @@ Outputs:
 
 import argparse
 import json
+import logging
 import os
 
 import numpy as np
@@ -27,6 +28,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from model import FactorTransformer, TimeSeriesDataset, get_device, normalize_horizons
+
+
+logger = logging.getLogger(__name__)
 
 
 def compute_metrics(pred: np.ndarray, target: np.ndarray, sigma: np.ndarray = None,
@@ -107,13 +111,13 @@ def run_inference(
         results_dir: where to save results
     """
     device = get_device()
-    print(f"Using device: {device}")
+    logger.info("Using device: %s", device)
 
     # Load checkpoint
     ckpt_path = os.path.join(checkpoint_dir, "best_model.pt")
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     config = ckpt["config"]
-    print(f"Loaded checkpoint (epoch {ckpt['epoch']}, val_loss={ckpt['val_loss']:.5f})")
+    logger.info("Loaded checkpoint (epoch %s, val_loss=%.5f)", ckpt["epoch"], ckpt["val_loss"])
 
     # Load normalization stats
     mean = float(np.load(os.path.join(checkpoint_dir, "mean.npy")))
@@ -125,8 +129,8 @@ def run_inference(
     # Test dataset
     test_ds = TimeSeriesDataset(returns, test_stocks, context_len, horizons=horizons, mean=mean, std=std)
     test_loader = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=0)
-    print(f"Test stocks: {test_stocks} ({len(test_ds)} samples)")
-    print(f"Horizons: {horizons}")
+    logger.info("Test stocks: %s (%d samples)", test_stocks, len(test_ds))
+    logger.info("Horizons: %s", horizons)
 
     # Rebuild model
     probabilistic = config.get("probabilistic", False)
@@ -143,9 +147,9 @@ def run_inference(
     ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
-    print(f"Parameters: {model.count_parameters():,}")
+    logger.info("Parameters: %s", f"{model.count_parameters():,}")
     if probabilistic:
-        print("Mode: probabilistic")
+        logger.info("Mode: probabilistic")
 
     # Run predictions
     all_preds = []
@@ -170,25 +174,25 @@ def run_inference(
 
     # Metrics
     metrics = compute_metrics(preds, targets, sigmas, horizons=horizons)
-    print("\n--- Test Metrics (normalised space) ---")
+    logger.info("--- Test Metrics (normalised space) ---")
     for k, v in metrics.items():
         if isinstance(v, float):
-            print(f"  {k}: {v:.4f}")
+            logger.info("  %s: %.4f", k, v)
 
     if metrics["r2_vs_naive"] < 0:
-        print("\n  WARNING: R² < 0. Model is worse than predicting zero.")
+        logger.warning("R² < 0. Model is worse than predicting zero.")
     elif metrics["r2_vs_naive"] < 0.02:
-        print("\n  NOTE: R² is near zero. Normal for high-noise returns.")
+        logger.info("R² is near zero. Normal for high-noise returns.")
 
-    print(f"\n--- Per-Horizon R² ---")
+    logger.info("--- Per-Horizon R² ---")
     for h in horizons:
-        print(f"  h={h:3d}: R²={metrics[f'r2_h{h}']:.4f}  dir_acc={metrics[f'dir_acc_h{h}']:.4f}")
+        logger.info("  h=%3d: R²=%.4f  dir_acc=%.4f", h, metrics[f"r2_h{h}"], metrics[f"dir_acc_h{h}"])
 
     if probabilistic:
-        print(f"\n--- Z-Score Signal Summary (longest horizon h={horizons[-1]}) ---")
-        print(f"  mean |z|:  {metrics['mean_abs_z']:.4f}")
-        print(f"  |z| > 1:   {metrics['z_gt_1_frac']:.1%}")
-        print(f"  |z| > 2:   {metrics['z_gt_2_frac']:.1%}")
+        logger.info("--- Z-Score Signal Summary (longest horizon h=%s) ---", horizons[-1])
+        logger.info("  mean |z|:  %.4f", metrics["mean_abs_z"])
+        logger.info("  |z| > 1:   %.1f%%", 100 * metrics["z_gt_1_frac"])
+        logger.info("  |z| > 2:   %.1f%%", 100 * metrics["z_gt_2_frac"])
 
     # Save
     os.makedirs(results_dir, exist_ok=True)
@@ -196,7 +200,7 @@ def run_inference(
     with open(metrics_path, "w") as f:
         json.dump({**metrics, "test_stocks": test_stocks, "probabilistic": probabilistic,
                    "horizons": horizons}, f, indent=2)
-    print(f"\nMetrics saved: {metrics_path}")
+    logger.info("Metrics saved: %s", metrics_path)
 
     # Plot
     plot_path = os.path.join(results_dir, "predictions.png")
@@ -256,7 +260,7 @@ def _plot_predictions(preds, targets, test_stocks, n_plot_stocks, save_path):
     plt.tight_layout()
     plt.savefig(save_path, dpi=120, bbox_inches="tight")
     plt.close()
-    print(f"Plot saved: {save_path}")
+    logger.info("Plot saved: %s", save_path)
 
 
 def _plot_zscore_distribution(preds, sigmas, test_stocks, save_path, horizons=None):
@@ -301,10 +305,16 @@ def _plot_zscore_distribution(preds, sigmas, test_stocks, save_path, horizons=No
     plt.tight_layout()
     plt.savefig(save_path, dpi=120, bbox_inches="tight")
     plt.close()
-    print(f"Z-score plot saved: {save_path}")
+    logger.info("Z-score plot saved: %s", save_path)
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--data", type=str, required=True)

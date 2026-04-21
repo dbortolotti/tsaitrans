@@ -15,11 +15,24 @@ All outputs go to output/<experiment_name>/:
 """
 
 import json
+import logging
 import os
 import shutil
 import sys
 
 import numpy as np
+
+
+logger = logging.getLogger(__name__)
+
+
+def configure_logging(level: int = logging.INFO):
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -153,10 +166,10 @@ def main(config_path: str, skip_data: bool = False, skip_transformer: bool = Fal
         if sys.stdin.isatty():
             ans = input(f"Output folder '{output_dir}' already exists. Proceed and overwrite? [Y/n] ").strip().lower()
             if ans == "n":
-                print("Aborting.")
+                logger.info("Aborting.")
                 sys.exit(0)
         else:
-            print(f"Output folder '{output_dir}' already exists. Proceeding (non-interactive).")
+            logger.info("Output folder '%s' already exists. Proceeding (non-interactive).", output_dir)
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -167,17 +180,17 @@ def main(config_path: str, skip_data: bool = False, skip_transformer: bool = Fal
     with open(os.path.join(output_dir, "resolved_config.json"), "w") as f:
         json.dump(config, f, indent=2)
 
-    print(f"Experiment: {name}")
-    print(f"Output dir: {output_dir}")
+    logger.info("Experiment: %s", name)
+    logger.info("Output dir: %s", output_dir)
 
     # --- Resolve base_experiment (reuse data + transformer from another run) ---
     base_experiment = config.get("base_experiment", None)
     if base_experiment:
         base_dir = os.path.join("output", base_experiment)
         if not os.path.isdir(base_dir):
-            print(f"[ERROR] base_experiment '{base_experiment}' not found at {base_dir}")
+            logger.error("base_experiment '%s' not found at %s", base_experiment, base_dir)
             sys.exit(1)
-        print(f"[INFO] Reusing data + transformer from base experiment: {base_experiment}")
+        logger.info("Reusing data + transformer from base experiment: %s", base_experiment)
 
         # Load the base experiment's resolved config to get its data section for stock splits
         base_resolved = os.path.join(base_dir, "resolved_config.json")
@@ -192,9 +205,9 @@ def main(config_path: str, skip_data: bool = False, skip_transformer: bool = Fal
     stock_split = compute_stock_split(data_cfg)
     n_stocks = sum(len(v) for v in stock_split.values())
 
-    print(f"\nStock split ({n_stocks} total):")
+    logger.info("Stock split (%d total):", n_stocks)
     for group, indices in stock_split.items():
-        print(f"  {group}: {indices}")
+        logger.info("  %s: %s", group, indices)
 
     # Add prediction/ and placing/ to path for imports
     repo_root = os.path.dirname(os.path.abspath(__file__))
@@ -215,17 +228,17 @@ def main(config_path: str, skip_data: bool = False, skip_transformer: bool = Fal
         # Find the data file (named after the base experiment)
         data_files = [f for f in os.listdir(data_dir) if f.startswith("returns_") and f.endswith(".npy")]
         if not data_files:
-            print(f"[ERROR] No returns file found in {data_dir}")
+            logger.error("No returns file found in %s", data_dir)
             sys.exit(1)
         data_file = os.path.join(data_dir, data_files[0])
         returns = np.load(data_file).astype(np.float32)
-        print(f"\n[REUSE] Loaded data from {data_file} — shape {returns.shape}")
+        logger.info("Loaded data from %s - shape %s", data_file, returns.shape)
 
         checkpoint_file = os.path.join(checkpoint_dir, "best_model.pt")
         if not os.path.exists(checkpoint_file):
-            print(f"[ERROR] No transformer checkpoint found at {checkpoint_file}")
+            logger.error("No transformer checkpoint found at %s", checkpoint_file)
             sys.exit(1)
-        print(f"[REUSE] Using transformer checkpoint from {checkpoint_dir}")
+        logger.info("Using transformer checkpoint from %s", checkpoint_dir)
 
         # Skip stages 1–4
         skip_data = True
@@ -240,17 +253,17 @@ def main(config_path: str, skip_data: bool = False, skip_transformer: bool = Fal
         # === Stage 1: Generate data ===
         data_file = os.path.join(data_dir, f"returns_{name}.npy")
         if skip_data and os.path.exists(data_file):
-            print("\n[SKIP] Stage 1: loading existing data")
+            logger.info("Stage 1 skipped: loading existing data")
             returns = np.load(data_file).astype(np.float32)
         else:
             if skip_data:
                 ans = input("\n[WARN] --skip-data: no existing data found. Generate now? [Y/n] ").strip().lower()
                 if ans == "n":
-                    print("Aborting.")
+                    logger.info("Aborting.")
                     sys.exit(1)
-            print("\n" + "=" * 60)
-            print("STAGE 1: Generate data")
-            print("=" * 60)
+            logger.info("%s", "=" * 60)
+            logger.info("STAGE 1: Generate data")
+            logger.info("%s", "=" * 60)
 
             from generate_data import generate, save
 
@@ -273,16 +286,16 @@ def main(config_path: str, skip_data: bool = False, skip_transformer: bool = Fal
         # === Stage 2: Train transformer ===
         checkpoint_file = os.path.join(checkpoint_dir, "best_model.pt")
         if skip_transformer and os.path.exists(checkpoint_file):
-            print("[SKIP] Stage 2: reusing existing transformer checkpoint")
+            logger.info("Stage 2 skipped: reusing existing transformer checkpoint")
         else:
             if skip_transformer:
                 ans = input("[WARN] --skip-transformer: no checkpoint found. Train now? [Y/n] ").strip().lower()
                 if ans == "n":
-                    print("Aborting.")
+                    logger.info("Aborting.")
                     sys.exit(1)
-            print("\n" + "=" * 60)
-            print("STAGE 2: Train transformer")
-            print("=" * 60)
+            logger.info("%s", "=" * 60)
+            logger.info("STAGE 2: Train transformer")
+            logger.info("%s", "=" * 60)
 
             from train import train as train_transformer
 
@@ -291,11 +304,11 @@ def main(config_path: str, skip_data: bool = False, skip_transformer: bool = Fal
 
         # === Stage 3: Transformer inference on test stocks ===
         if skip_transformer and os.path.exists(checkpoint_file):
-            print("[SKIP] Stage 3: skipping inference (transformer was skipped)")
+            logger.info("Stage 3 skipped: skipping inference (transformer was skipped)")
         else:
-            print("\n" + "=" * 60)
-            print("STAGE 3: Transformer inference (test stocks)")
-            print("=" * 60)
+            logger.info("%s", "=" * 60)
+            logger.info("STAGE 3: Transformer inference (test stocks)")
+            logger.info("%s", "=" * 60)
 
             from inference import run_inference
 
@@ -304,11 +317,11 @@ def main(config_path: str, skip_data: bool = False, skip_transformer: bool = Fal
         # === Stage 4: Phase 0 analytical backtest ===
         backtest_dir = os.path.join(output_dir, "backtest")
         if skip_backtest or skip_transformer:
-            print("[SKIP] Stage 4: backtest skipped")
+            logger.info("Stage 4 skipped: backtest skipped")
         else:
-            print("\n" + "=" * 60)
-            print("STAGE 4: Phase 0 analytical backtest")
-            print("=" * 60)
+            logger.info("%s", "=" * 60)
+            logger.info("STAGE 4: Phase 0 analytical backtest")
+            logger.info("%s", "=" * 60)
 
             from backtest import run_backtest
 
@@ -319,11 +332,11 @@ def main(config_path: str, skip_data: bool = False, skip_transformer: bool = Fal
 
     # === Stage 5: Train RL ===
     if skip_rl:
-        print("[SKIP] Stage 5: RL training skipped")
+        logger.info("Stage 5 skipped: RL training skipped")
     else:
-        print("\n" + "=" * 60)
-        print("STAGE 5: Train RL agent")
-        print("=" * 60)
+        logger.info("%s", "=" * 60)
+        logger.info("STAGE 5: Train RL agent")
+        logger.info("%s", "=" * 60)
 
         from train_rl import train as train_rl
 
@@ -331,10 +344,10 @@ def main(config_path: str, skip_data: bool = False, skip_transformer: bool = Fal
         train_rl(rl_cfg, returns, stock_split, rl_dir, transformer_checkpoint=checkpoint_dir)
 
     # === Done ===
-    print("\n" + "=" * 60)
-    print(f"Experiment '{name}' complete.")
-    print(f"All outputs in: {output_dir}/")
-    print("=" * 60)
+    logger.info("%s", "=" * 60)
+    logger.info("Experiment '%s' complete.", name)
+    logger.info("All outputs in: %s/", output_dir)
+    logger.info("%s", "=" * 60)
 
 
 if __name__ == "__main__":
@@ -352,5 +365,6 @@ if __name__ == "__main__":
                         help="Skip stage 5 (RL training)")
     args = parser.parse_args()
 
+    configure_logging()
     main(args.config, skip_data=args.skip_data, skip_transformer=args.skip_transformer,
          skip_backtest=args.skip_backtest, skip_rl=args.skip_rl)
