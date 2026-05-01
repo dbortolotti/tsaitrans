@@ -5,7 +5,7 @@ chat can resume quickly.
 
 ## Repo / Branch
 
-- Repo: `/Users/oric/git/tsaitrans`
+- Repo: `.`
 - Current branch: likely `codex/market-making-refresh`
 
 ## What Changed
@@ -22,13 +22,13 @@ We redesigned the market-making setup around:
 
 Key files:
 
-- [placing/market_env.py](/Users/oric/git/tsaitrans/placing/market_env.py)
-- [RL_DESIGN.md](/Users/oric/git/tsaitrans/RL_DESIGN.md)
-- [MARKET_ENV.md](/Users/oric/git/tsaitrans/MARKET_ENV.md)
+- [placing/market_env.py](placing/market_env.py)
+- [RL_DESIGN.md](RL_DESIGN.md)
+- [MARKET_ENV.md](MARKET_ENV.md)
 
 ### Current reward
 
-Implemented reward in [placing/market_env.py](/Users/oric/git/tsaitrans/placing/market_env.py):
+Implemented reward in [placing/market_env.py](placing/market_env.py):
 
 ```text
 reward_t
@@ -78,14 +78,14 @@ Structured logging was added across the pipeline. RL logs include:
 
 Relevant files:
 
-- [placing/train_rl.py](/Users/oric/git/tsaitrans/placing/train_rl.py)
-- [run_experiment.py](/Users/oric/git/tsaitrans/run_experiment.py)
+- [placing/train_rl.py](placing/train_rl.py)
+- [run_experiment.py](run_experiment.py)
 
 ## Main Experiment
 
 Primary experiment config:
 
-- [experiments/mm_stable_reuse_latest_transformer.json](/Users/oric/git/tsaitrans/experiments/mm_stable_reuse_latest_transformer.json)
+- [experiments/mm_stable_reuse_latest_transformer.json](experiments/mm_stable_reuse_latest_transformer.json)
 
 Important recent values used there:
 
@@ -115,8 +115,8 @@ So reward shaping alone did not cleanly solve the problem.
 
 We created a new config-driven grid search runner:
 
-- [grid_search.py](/Users/oric/git/tsaitrans/grid_search.py)
-- [experiments/mm_reward_grid.json](/Users/oric/git/tsaitrans/experiments/mm_reward_grid.json)
+- [grid_search.py](grid_search.py)
+- [experiments/mm_reward_grid.json](experiments/mm_reward_grid.json)
 
 Important fixes made during setup:
 
@@ -124,7 +124,7 @@ Important fixes made during setup:
    - `output/<run_name>/grid_run.log`
 2. `grid_search.py` now launches `run_experiment.py` non-interactively using
    `stdin=subprocess.DEVNULL`
-3. [run_experiment.py](/Users/oric/git/tsaitrans/run_experiment.py) was fixed so
+3. [run_experiment.py](run_experiment.py) was fixed so
    `base_experiment` reuses the base DGP / checkpoint while preserving explicit
    `data` overrides in the current config
 
@@ -157,11 +157,11 @@ Total runs:
 
 Master sweep log:
 
-- [log_mm_reward_grid.txt](/Users/oric/git/tsaitrans/log_mm_reward_grid.txt)
+- [log_mm_reward_grid.txt](log_mm_reward_grid.txt)
 
 Aggregate summary:
 
-- [experiments/generated/mm_reward_grid/summary.json](/Users/oric/git/tsaitrans/experiments/generated/mm_reward_grid/summary.json)
+- [experiments/generated/mm_reward_grid/summary.json](experiments/generated/mm_reward_grid/summary.json)
 
 The full 36-run sweep completed.
 
@@ -173,7 +173,7 @@ Best run according to the grid runner:
 
 Path:
 
-- [best run dir](/Users/oric/git/tsaitrans/output/mm_reward_grid__max_position10__kappa_base5em06__alignment_coef0p04__trade_penalty0)
+- [best run dir](output/mm_reward_grid__max_position10__kappa_base5em06__alignment_coef0p04__trade_penalty0)
 
 Training-tail metrics:
 
@@ -194,7 +194,7 @@ The user then asked for **50 simulations** on the best grid result.
 
 ### Important simulator fix
 
-[simulate.py](/Users/oric/git/tsaitrans/simulate.py) was stale and had to be
+[simulate.py](simulate.py) was stale and had to be
 updated to:
 
 - work with `base_experiment` runs
@@ -207,11 +207,11 @@ updated to:
 
 Evaluated run:
 
-- [output/mm_reward_grid__max_position10__kappa_base5em06__alignment_coef0p04__trade_penalty0](/Users/oric/git/tsaitrans/output/mm_reward_grid__max_position10__kappa_base5em06__alignment_coef0p04__trade_penalty0)
+- [output/mm_reward_grid__max_position10__kappa_base5em06__alignment_coef0p04__trade_penalty0](output/mm_reward_grid__max_position10__kappa_base5em06__alignment_coef0p04__trade_penalty0)
 
 Saved summary:
 
-- [sim_summary_50.json](/Users/oric/git/tsaitrans/output/mm_reward_grid__max_position10__kappa_base5em06__alignment_coef0p04__trade_penalty0/checkpoints_rl/sim_summary_50.json)
+- [sim_summary_50.json](output/mm_reward_grid__max_position10__kappa_base5em06__alignment_coef0p04__trade_penalty0/checkpoints_rl/sim_summary_50.json)
 
 Results over 50 deterministic fresh sims:
 
@@ -241,7 +241,7 @@ of:
 
 Most sensible next action in a new chat:
 
-1. read [experiments/generated/mm_reward_grid/summary.json](/Users/oric/git/tsaitrans/experiments/generated/mm_reward_grid/summary.json)
+1. read [experiments/generated/mm_reward_grid/summary.json](experiments/generated/mm_reward_grid/summary.json)
 2. identify top 3-5 candidates by training-tail metrics
 3. run 50 fresh sims on each
 4. compare out-of-sample mean/median PnL and position usage
@@ -250,9 +250,9 @@ This is preferable to further tweaking the reward based only on training logs.
 
 ## Useful Artifacts
 
-- [grid_search.py](/Users/oric/git/tsaitrans/grid_search.py)
-- [simulate.py](/Users/oric/git/tsaitrans/simulate.py)
-- [experiments/mm_reward_grid.json](/Users/oric/git/tsaitrans/experiments/mm_reward_grid.json)
-- [experiments/generated/mm_reward_grid/summary.json](/Users/oric/git/tsaitrans/experiments/generated/mm_reward_grid/summary.json)
-- [best run log](/Users/oric/git/tsaitrans/output/mm_reward_grid__max_position10__kappa_base5em06__alignment_coef0p04__trade_penalty0/grid_run.log)
-- [50-sim summary](/Users/oric/git/tsaitrans/output/mm_reward_grid__max_position10__kappa_base5em06__alignment_coef0p04__trade_penalty0/checkpoints_rl/sim_summary_50.json)
+- [grid_search.py](grid_search.py)
+- [simulate.py](simulate.py)
+- [experiments/mm_reward_grid.json](experiments/mm_reward_grid.json)
+- [experiments/generated/mm_reward_grid/summary.json](experiments/generated/mm_reward_grid/summary.json)
+- [best run log](output/mm_reward_grid__max_position10__kappa_base5em06__alignment_coef0p04__trade_penalty0/grid_run.log)
+- [50-sim summary](output/mm_reward_grid__max_position10__kappa_base5em06__alignment_coef0p04__trade_penalty0/checkpoints_rl/sim_summary_50.json)
